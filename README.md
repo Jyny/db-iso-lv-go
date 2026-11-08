@@ -11,7 +11,7 @@
 
 ```bash
 make up          # docker-compose 起 PG(55432) + MySQL(53306)
-make test        # 全部實驗（約 20 秒）
+make test        # 全部實驗（約 40 秒）
 make hermitage   # 隔離等級異常矩陣
 go test -p 1 -count=1 -v ./mysql -run 'TestLock_GapLockOnMissingKey'   # 看單一實驗的時間軸
 ```
@@ -169,7 +169,7 @@ InnoDB 在「等待會形成環」的當下**立即**偵測，回滾 weight 較�
 
 ## 4. 隔離等級：Hermitage 矩陣（`hermitage/`，實測）
 
-[Hermitage](https://github.com/ept/hermitage) 的每個異常都在每個 DB × 每個隔離等級自動跑一次。✗ = 異常發生；✓ = 被防止，後面註明**靠什麼防止**：
+[Hermitage](https://github.com/ept/hermitage) 的每個異常都在每個 DB × 每個隔離等級自動跑一次。✗ = 異常發生；✓ = 被防止，後面註明**靠什麼防止**（整格含機制都由測試斷言，結果是決定性的）：
 
 - `mvcc`：快照讓交易根本看不到別人的寫入
 - `lock`：被鎖擋住、被迫排隊（等於序列執行）

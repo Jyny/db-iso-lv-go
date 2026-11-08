@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -26,6 +28,7 @@ type Session struct {
 	ops       chan *Op
 	exited    chan struct{}
 	closeOnce sync.Once
+	closing   atomic.Bool
 
 	mu       sync.Mutex
 	inflight *Op
@@ -72,7 +75,12 @@ func mustExecConn(t testing.TB, c *sql.Conn, q string) {
 
 func (s *Session) close() { s.closeOnce.Do(s.doClose) }
 
+// ErrSessionClosed replaces the driver error of a statement that was still running (usually
+// still blocked) when the test ended and the harness killed its session.
+var ErrSessionClosed = errors.New("still running when the test ended; session closed")
+
 func (s *Session) doClose() {
+	s.closing.Store(true)
 	// Kill the connection server-side first: if it is stuck waiting for a lock,
 	// closing the socket alone does not make the server release its locks promptly.
 	switch s.lab.Kind {
@@ -263,6 +271,10 @@ func (s *Session) worker() {
 		s.mu.Unlock()
 
 		s.run(op)
+		if s.closing.Load() && op.Err != nil && !op.Skipped {
+			// Not a result of the experiment: the harness killed the connection at cleanup.
+			op.Err = ErrSessionClosed
+		}
 
 		// Mark the session idle BEFORE signalling done: whoever waits on op.done may
 		// immediately issue the next Do, which must not see this op as still pending.
@@ -421,6 +433,8 @@ func (op *Op) resultSuffix() string {
 			return "   → transaction was already aborted; ROLLBACK issued instead"
 		}
 		return "   → (skipped: transaction already aborted)"
+	case errors.Is(op.Err, ErrSessionClosed):
+		return "   → (" + ErrSessionClosed.Error() + ")"
 	case op.Err != nil:
 		return "   ✗ " + Describe(op.Err)
 	case op.Cols != nil:

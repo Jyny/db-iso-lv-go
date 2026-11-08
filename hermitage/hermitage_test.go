@@ -284,22 +284,31 @@ const (
 	P = "✓" // prevented
 )
 
+// Expected cells: the anomaly happens (A), or it is prevented by one of these mechanisms.
+// The mechanism is part of the result: it is what each isolation level is built on.
+const (
+	mv = "✓ mvcc"     // snapshot read: the other transaction's writes are simply invisible
+	lk = "✓ lock"     // a lock wait forced the transactions into a serial order
+	ab = "✓ abort"    // the DB detected the conflict and failed one transaction (40001)
+	dl = "✓ deadlock" // locking turned the would-be cycle into a deadlock (40P01 / 1213)
+)
+
 // expected[db][level], in scenarios order.
 var expected = map[lab.Kind]map[lab.Level][]string{
 	lab.Postgres: {
-		//                      G0 G1a G1b G1c OTV PMP PMPw P4 Gs Gsw G2i G2 RO
-		lab.ReadUncommitted: {P, P, P, P, P, A, A, A, A, A, A, A, A},
-		lab.ReadCommitted:   {P, P, P, P, P, A, A, A, A, A, A, A, A},
-		lab.RepeatableRead:  {P, P, P, P, P, P, P, P, P, P, A, A, A},
-		lab.Serializable:    {P, P, P, P, P, P, P, P, P, P, P, P, P},
+		//                      G0  G1a G1b G1c OTV PMP PMPw P4 Gs  Gsw G2i G2 RO
+		lab.ReadUncommitted: {lk, mv, mv, mv, lk, A, A, A, A, A, A, A, A},
+		lab.ReadCommitted:   {lk, mv, mv, mv, lk, A, A, A, A, A, A, A, A},
+		lab.RepeatableRead:  {ab, mv, mv, mv, ab, mv, ab, ab, mv, ab, A, A, A},
+		lab.Serializable:    {ab, mv, mv, ab, ab, mv, ab, ab, mv, ab, ab, ab, ab},
 	},
 	lab.MySQL: {
 		// RU passes PMP-write by luck: T2's SELECT dirty-reads T1's uncommitted (1,20)
 		// and deletes id=1, which happens to equal serial T1→T2. RU is not safe (see G1a).
-		lab.ReadUncommitted: {P, A, A, A, A, A, P, A, A, A, A, A, A},
-		lab.ReadCommitted:   {P, P, P, P, P, A, A, A, A, A, A, A, A},
-		lab.RepeatableRead:  {P, P, P, P, P, P, A, A, P, A, A, A, A},
-		lab.Serializable:    {P, P, P, P, P, P, P, P, P, P, P, P, P},
+		lab.ReadUncommitted: {lk, A, A, A, A, A, lk, A, A, A, A, A, A},
+		lab.ReadCommitted:   {lk, mv, mv, mv, lk, A, A, A, A, A, A, A, A},
+		lab.RepeatableRead:  {lk, mv, mv, mv, lk, mv, A, A, mv, A, A, A, A},
+		lab.Serializable:    {lk, lk, lk, dl, lk, lk, lk, dl, lk, dl, dl, dl, dl},
 	},
 }
 
@@ -349,8 +358,9 @@ func TestHermitage(t *testing.T) {
 							}
 							results[kind][level] = append(results[kind][level], c)
 							L.Note("result: %s %s   final rows: %s", c.got, c.how, e.final())
-							if want := expected[kind][level][i]; want != c.got {
-								t.Errorf("%s %s %s: want %s, got %s %s", kind, level.Short(), sc.name, want, c.got, c.how)
+							got := strings.TrimSpace(c.got + " " + c.how)
+							if want := expected[kind][level][i]; want != got {
+								t.Errorf("%s %s %s: want %s, got %s", kind, level.Short(), sc.name, want, got)
 							}
 						})
 					}
