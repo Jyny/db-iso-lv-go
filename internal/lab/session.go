@@ -21,10 +21,11 @@ type Session struct {
 	// ID is the PG backend pid or the MySQL connection id, used to observe the session from the DB side.
 	ID int64
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	ops    chan *Op
-	exited chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
+	ops       chan *Op
+	exited    chan struct{}
+	closeOnce sync.Once
 
 	mu       sync.Mutex
 	inflight *Op
@@ -69,7 +70,9 @@ func mustExecConn(t testing.TB, c *sql.Conn, q string) {
 	}
 }
 
-func (s *Session) close() {
+func (s *Session) close() { s.closeOnce.Do(s.doClose) }
+
+func (s *Session) doClose() {
 	// Kill the connection server-side first: if it is stuck waiting for a lock,
 	// closing the socket alone does not make the server release its locks promptly.
 	switch s.lab.Kind {
@@ -187,7 +190,7 @@ func (s *Session) Do(query string, args ...any) *Op {
 	s.lab.mu.Unlock()
 	s.mu.Lock()
 	s.pending++
-	queuedBehind := s.inflight != nil || s.pending > 1
+	queuedBehind := s.pending > 1
 	s.mu.Unlock()
 	s.ops <- op
 
@@ -261,6 +264,13 @@ func (s *Session) worker() {
 
 		s.run(op)
 
+		// Mark the session idle BEFORE signalling done: whoever waits on op.done may
+		// immediately issue the next Do, which must not see this op as still pending.
+		s.mu.Lock()
+		s.inflight = nil
+		s.pending--
+		s.mu.Unlock()
+
 		op.mu.Lock()
 		close(op.done)
 		detached := op.detached
@@ -269,11 +279,6 @@ func (s *Session) worker() {
 			s.lab.deferLine(fmt.Sprintf("     %s%s │ ↳ #%d done (waited %v)%s", strings.Repeat("        ", s.idx), s.Name,
 				op.Seq, op.Elapsed.Round(time.Millisecond), op.resultSuffix()))
 		}
-
-		s.mu.Lock()
-		s.inflight = nil
-		s.pending--
-		s.mu.Unlock()
 	}
 }
 
@@ -285,6 +290,10 @@ func isTxStart(q string) bool {
 func isTxEnd(q string) bool {
 	u := strings.ToUpper(strings.TrimSpace(q))
 	return strings.HasPrefix(u, "COMMIT") || strings.HasPrefix(u, "ROLLBACK") || strings.HasPrefix(u, "ABORT")
+}
+
+func isSetTransaction(q string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(q)), "SET TRANSACTION")
 }
 
 func isQuery(q string) bool {
@@ -309,14 +318,25 @@ func (s *Session) run(op *Op) {
 	// is rolled back and any following statement would silently run in autocommit mode,
 	// corrupting the experiment, so skip everything until the transaction ends.
 	if abortErr != nil {
-		if isTxEnd(op.SQL) {
+		switch {
+		case isTxEnd(op.SQL):
 			_, _ = s.conn.ExecContext(s.ctx, "ROLLBACK")
 			s.mu.Lock()
 			s.abortErr, s.inTx = nil, false
 			s.mu.Unlock()
+			op.Skipped, op.Err = true, abortErr
+			return
+		case s.lab.Kind == MySQL && (isTxStart(op.SQL) || isSetTransaction(op.SQL)):
+			// On MySQL the aborted transaction is already gone, so the application starting
+			// its retry (SET TRANSACTION / START TRANSACTION) begins a fresh one; run it.
+			// (On PG the session stays in the aborted transaction until ROLLBACK.)
+			s.mu.Lock()
+			s.abortErr, s.inTx = nil, false
+			s.mu.Unlock()
+		default:
+			op.Skipped, op.Err = true, abortErr
+			return
 		}
-		op.Skipped, op.Err = true, abortErr
-		return
 	}
 
 	if isQuery(op.SQL) {

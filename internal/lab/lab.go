@@ -90,12 +90,20 @@ func dsn(kind Kind, dbname string) string {
 	switch kind {
 	case Postgres:
 		base := envOr("LAB_PG_DSN", "postgres://postgres:lab@127.0.0.1:55432/%s?sslmode=disable")
-		return fmt.Sprintf(base, dbname) + "&default_query_exec_mode=simple_protocol"
+		return withParams(fmt.Sprintf(base, dbname), "default_query_exec_mode=simple_protocol")
 	case MySQL:
 		base := envOr("LAB_MYSQL_DSN", "root:lab@tcp(127.0.0.1:53306)/%s")
-		return fmt.Sprintf(base, dbname) + "?interpolateParams=true&parseTime=true"
+		return withParams(fmt.Sprintf(base, dbname), "interpolateParams=true&parseTime=true")
 	}
 	panic("unknown kind " + kind)
+}
+
+// withParams appends query parameters to a DSN that may or may not already have some.
+func withParams(dsn, params string) string {
+	if strings.Contains(dsn, "?") {
+		return dsn + "&" + params
+	}
+	return dsn + "?" + params
 }
 
 func envOr(k, def string) string {

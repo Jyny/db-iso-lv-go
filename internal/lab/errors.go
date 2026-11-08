@@ -81,7 +81,9 @@ func ExpectOneDeadlockVictim(t testing.TB, ops ...*Op) (victim *Op) {
 	for _, op := range ops {
 		op.Wait()
 		switch {
-		case op.Err != nil && IsDeadlock(op.Err) && !op.Skipped:
+		case op.Skipped:
+			// Not executed: it only carries the victim's error forward.
+		case op.Err != nil && IsDeadlock(op.Err):
 			victim = op
 			victims = append(victims, op.S.Name)
 		case op.Err != nil:

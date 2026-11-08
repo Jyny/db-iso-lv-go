@@ -124,7 +124,15 @@ func runBank(t *testing.T, kind lab.Kind, level lab.Level) *stats {
 	}
 
 	db := L.Admin
+	// ALTER DATABASE only affects new connections; drop the idle ones from setup.
+	db.SetMaxIdleConns(0)
+	db.SetMaxIdleConns(writers + readers + 2)
 	db.SetMaxOpenConns(writers + readers + 2)
+	if kind == lab.Postgres {
+		if got := L.QueryString("SHOW deadlock_timeout"); got != "100ms" {
+			t.Fatalf("pooled connection has deadlock_timeout = %s, want 100ms", got)
+		}
+	}
 	iso := isoLevels[level]
 	st := &stats{expectedTotal: accounts * initial}
 	st.minSeen.Store(1 << 62)
