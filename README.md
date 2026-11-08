@@ -221,6 +221,32 @@ InnoDB 在「等待會形成環」的當下**立即**偵測，回滾 weight 較�
 | `postgres/TestIso_SER_FalsePositiveFromSeqScan` | **SSI 的 false positive**：seq scan 拿 relation 級 SIRead 鎖，兩個交易操作完全不相干的 group 仍會 `40001`；改用 index scan 就沒事 |
 | `mysql/TestIso_SER_AutocommitSelectStaysNonLocking` | MySQL SERIALIZABLE 只把**顯式交易中**的 SELECT 變成鎖定讀；autocommit 的 SELECT 仍是快照讀 |
 
+### Jepsen 風格隨機壓測（`jepsen/`，實測）
+
+Hermitage 是「人工挑好的一種交錯」；[Jepsen](https://github.com/jepsen-io/jepsen) 的做法是**大量並發隨機交易，再對整段歷史檢查不變式**。這裡實作 Jepsen 經典的 **bank test**：
+
+- 8 個 writer 隨機轉帳：讀兩個帳戶餘額 → 在 Go 裡計算 → 寫回（client 端 read-modify-write）
+- 2 個 reader：在**同一個交易裡**把 5 個帳戶逐一 SELECT 加總**兩次**
+- 遇到死鎖 / serialization failure 就整個交易重試（正確的應用程式寫法）
+
+| DB | Level | commits | retries | unstable reads（兩次加總不同） | 讀到總額 ≠ 500 | 最終總額 |
+|---|---|---|---|---|---|---|
+| postgres | RU | 1590 | 20 | 53 / 1501 | 1394 / 1501 | 530 ✗ |
+| postgres | RC | 1478 | 21 | 32 / 1430 | 1430 / 1430 | 449 ✗ |
+| postgres | RR | 1410 | 489 | **0** | **0** | **500** |
+| postgres | SER | 1507 | 389 | **0** | **0** | **500** |
+| mysql | RU | 2442 | 83 | 595 / 825 | 823 / 825 | 7 ✗ |
+| mysql | RC | 1827 | 74 | 776 / 885 | 881 / 885 | 1858 ✗ |
+| mysql | RR | 1915 | 86 | **0** | 915 / 920 | **27559 ✗** |
+| mysql | SER | 608 | 1715 | **0** | **0** | **500** |
+
+（每格跑 1.5 秒，數字每次不同，但 ✗ 的模式很穩定。）
+
+- **MySQL RR 最值得看**：unstable reads = 0，快照完全一致；但總額從 500 漂到 27559，因為 RR 不擋 lost update（Hermitage P4）。「快照一致」不等於「資料正確」。
+- **PG RR 靠 abort 保住正確性**：489 次重試換來總額不變（first-updater-wins）。
+- **MySQL SER 靠鎖**：正確，但 1715 次死鎖重試，commits 只有其他等級的 1/3。這就是 SERIALIZABLE-by-locking 的代價。
+- 弱等級的異常是機率性的，測試只對「有保證的等級」（PG RR/SER、MySQL SER）做斷言，弱等級只回報。
+
 ---
 
 ## 5. 做實驗時踩到的坑（也是知識點）
@@ -237,6 +263,7 @@ InnoDB 在「等待會形成環」的當下**立即**偵測，回滾 weight 較�
 ```
 internal/lab/        多 session 交錯執行框架（Session、Op、等鎖偵測、鎖觀察、錯誤分類）
 hermitage/           Hermitage 異常矩陣（PG + MySQL × 4 levels × 13 anomalies）
+jepsen/              Jepsen 風格 bank test：並發隨機轉帳 + 不變式檢查
 postgres/            mvcc_test / locks_test / deadlock_test / isolation_test
 mysql/               mvcc_test / locks_test / deadlock_test / isolation_test
 docker-compose.yml   postgres:18.6、mysql:9.7.4
