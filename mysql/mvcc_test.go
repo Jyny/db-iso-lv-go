@@ -126,10 +126,11 @@ func TestMVCC_LongReadViewBlocksPurge(t *testing.T) {
 	L.Loud()
 	peak := historyListLength(L)
 	L.Note("history list length: %d → %d after 200 commits while RD's read view is open", before, peak)
-	if peak < before+150 {
-		// The history list is server-wide: other packages (go test ./... runs them in
-		// parallel) commit and get purged at the same time, which skews the numbers.
-		t.Skipf("history list %d → %d: other workload on the server interfered; run with `go test -p 1` (make test)", before, peak)
+	// Purge may still discard undo OLDER than RD's read view (e.g. a backlog left by earlier
+	// workloads such as ../jepsen), so "before" says little. What it must keep is every
+	// version newer than the view: all 200 of ours.
+	if peak < 200 {
+		t.Fatalf("history list is %d; the 200 versions newer than RD's read view must be retained", peak)
 	}
 	rd.Do("SELECT v FROM t WHERE id = 10").MustRows("(0)")
 	rd.Do("COMMIT")
@@ -147,6 +148,9 @@ func TestMVCC_LongReadViewBlocksPurge(t *testing.T) {
 			L.Show("SELECT ID, USER, DB, COMMAND, TIME, STATE, INFO FROM performance_schema.processlist WHERE COMMAND <> 'Daemon'")
 			t.Fatalf("history list did not shrink after the read view closed: %d", now)
 		}
+		// The purge coordinator sleeps when it sees no new commits, so a small leftover history
+		// can sit untouched on an idle server. One tiny commit wakes it up.
+		L.Exec("UPDATE t SET v = v + 1 WHERE id = 30")
 		time.Sleep(200 * time.Millisecond)
 	}
 }
