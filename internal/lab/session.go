@@ -132,8 +132,10 @@ func (s *Session) WaitingForLock() bool {
 	switch s.lab.Kind {
 	case Postgres:
 		// wait_event_type = 'Lock' covers heavyweight locks: relation / tuple / transactionid / advisory ...
+		// SafeSnapshot is a SERIALIZABLE READ ONLY DEFERRABLE transaction waiting for the
+		// concurrent read-write serializable transactions to finish: blocked by them, like a lock.
 		_ = s.lab.Admin.QueryRow(
-			"SELECT coalesce(wait_event_type = 'Lock', false) FROM pg_stat_activity WHERE pid = $1", s.ID,
+			"SELECT coalesce(wait_event_type = 'Lock' OR wait_event = 'SafeSnapshot', false) FROM pg_stat_activity WHERE pid = $1", s.ID,
 		).Scan(&waiting)
 	case MySQL:
 		// InnoDB row-lock waits are in performance_schema.data_lock_waits; MDL / table / user-lock

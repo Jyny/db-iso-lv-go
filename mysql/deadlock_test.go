@@ -159,6 +159,57 @@ var deadlockCases = []deadlockCase{
 			"S locks that later need upgrading, so they simply queue",
 	},
 	{
+		name: "Manual_InsertDuplicatePK_3Sessions", ref: "MySQL manual 17.7.3 (INSERT)",
+		why: "the manual's t1(i PK) example: T2 and T3 wait with S locks on T1's uncommitted 1;\n" +
+			"T1 rolls back, both S locks are granted, and both need X to insert",
+		setup: []string{"DROP TABLE IF EXISTS t1", "CREATE TABLE t1 (i INT, PRIMARY KEY (i)) ENGINE = InnoDB"},
+		steps: []step{
+			{1, "INSERT INTO t1 VALUES (1)"},
+			{2, "INSERT INTO t1 VALUES (1)"},
+			{3, "INSERT INTO t1 VALUES (1)"},
+			{1, "ROLLBACK"},
+		},
+		deadlock: true,
+	},
+	{
+		name: "Manual_DeleteThenInsertPK_3Sessions", ref: "MySQL manual 17.7.3 (INSERT, second variant)",
+		why: "T1 deletes the existing row 1; T2 and T3 insert 1 and wait with S locks; T1 commits,\n" +
+			"both S locks are granted on the delete-marked record, and both need X",
+		setup: []string{"DROP TABLE IF EXISTS t1", "CREATE TABLE t1 (i INT, PRIMARY KEY (i)) ENGINE = InnoDB", "INSERT INTO t1 VALUES (1)"},
+		steps: []step{
+			{1, "DELETE FROM t1 WHERE i = 1"},
+			{2, "INSERT INTO t1 VALUES (1)"},
+			{3, "INSERT INTO t1 VALUES (1)"},
+			{1, "COMMIT"},
+		},
+		deadlock: true,
+	},
+	{
+		name: "Manual_CounterForShare", ref: "MySQL manual 17.7.2.4",
+		why: "reading a counter FOR SHARE and then incrementing it: both hold S, both need X",
+		setup: []string{"DROP TABLE IF EXISTS child_codes", "CREATE TABLE child_codes (id int PRIMARY KEY, counter_field int)",
+			"INSERT INTO child_codes VALUES (1, 0)"},
+		steps: []step{
+			{1, "SELECT counter_field FROM child_codes FOR SHARE"},
+			{2, "SELECT counter_field FROM child_codes FOR SHARE"},
+			{1, "UPDATE child_codes SET counter_field = counter_field + 1"},
+			{2, "UPDATE child_codes SET counter_field = counter_field + 1"},
+		},
+		deadlock: true,
+	},
+	{
+		name: "CheckThenInsert_ReadCommitted", ref: "MySQL manual 17.7.5.3", level: lab.ReadCommitted,
+		why: "the same check-then-insert as CheckThenInsert_GapLocks, but READ COMMITTED takes no gap\n" +
+			"locks for searches, so there is nothing for the inserts to collide with",
+		steps: []step{
+			{1, "SELECT * FROM t WHERE id = 15 FOR UPDATE"},
+			{2, "SELECT * FROM t WHERE id = 16 FOR UPDATE"},
+			{1, "INSERT INTO t VALUES (15, 15, 0)"},
+			{2, "INSERT INTO t VALUES (16, 16, 0)"},
+		},
+		deadlock: false,
+	},
+	{
 		name: "Serializable_ReadThenUpdate", level: lab.Serializable,
 		why: "in SERIALIZABLE a plain SELECT takes S locks; both read, then both try to write\n" +
 			"→ S→X upgrade deadlock (the price of SERIALIZABLE-by-locking)",

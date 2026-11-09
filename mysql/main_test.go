@@ -23,7 +23,8 @@ func newLab(t *testing.T) *lab.Lab {
 //	k (non-unique secondary index idx_k) : 10, 20, 30
 //	v (no index)
 func setupT(L *lab.Lab) {
-	L.Exec("DROP TABLE IF EXISTS t",
+	// fkc (TestLock_LocksSetByStatement) references t; drop it first or DROP TABLE t fails.
+	L.Exec("DROP TABLE IF EXISTS fkc", "DROP TABLE IF EXISTS t",
 		"CREATE TABLE t (id int PRIMARY KEY, k int, v int, KEY idx_k (k))",
 		"INSERT INTO t VALUES (10, 10, 0), (20, 20, 0), (30, 30, 0)")
 }
