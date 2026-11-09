@@ -8,6 +8,7 @@ package mysql
 // README §7 maps every subsection to the tests that cover it.
 
 import (
+	"database/sql"
 	"fmt"
 	"slices"
 	"strings"
@@ -915,4 +916,201 @@ func TestLock_CATSSchedulesHeaviestWaiterFirst(t *testing.T) {
 		s.Do("ROLLBACK")
 	}
 	L.WaitAll()
+}
+
+// 17.7.3 LOCK TABLES: it commits the open transaction implicitly, and locking more tables
+// later in the transaction implicitly unlocks the earlier ones (it does UNLOCK TABLES first).
+func TestTx_LockTablesImplicitCommit(t *testing.T) {
+	L := newLab(t)
+	setupT(L)
+	L.Exec("DROP TABLE IF EXISTS lt2", "CREATE TABLE lt2 (id int PRIMARY KEY)")
+	s, other := L.Session("S"), L.Session("O")
+	s.Do("START TRANSACTION")
+	s.Do("INSERT INTO t VALUES (40, 40, 0)")
+	s.Do("LOCK TABLES t READ")
+	s.Do("ROLLBACK")
+	s.Do("UNLOCK TABLES")
+	if n := L.QueryString("SELECT count(*) FROM t WHERE id = 40"); n != "1" {
+		t.Fatal("LOCK TABLES did not commit the open transaction: the INSERT was rolled back")
+	}
+
+	s.Do("LOCK TABLES t WRITE")
+	sel := other.Do("SELECT count(*) FROM t").MustBlock()
+	s.Do("LOCK TABLES lt2 READ")
+	L.Note("locking lt2 released the lock on t")
+	sel.MustOK()
+	s.Do("UNLOCK TABLES")
+}
+
+// 17.7.3 innodb_table_locks: with autocommit = 0, LOCK TABLES also takes an InnoDB table lock
+// unless innodb_table_locks = 0. Two measured differences from the 8.4 manual on 9.7:
+//   - the manual says the variable has no effect on LOCK TABLES ... WRITE; on 9.7, 0 drops
+//     the InnoDB table lock for WRITE too.
+//   - the manual says that with 0, LOCK TABLES "completes even if other transactions hold row
+//     locks"; it still waits, on the metadata lock the other transaction holds until it
+//     ends, before InnoDB is even asked.
+func TestLock_InnoDBTableLocksVariable(t *testing.T) {
+	L := newLab(t)
+	setupT(L)
+	s, other := L.Session("S"), L.Session("O")
+	innodbTableLock := func() string {
+		for _, k := range L.Locks() {
+			if k.Session == "S" && k.Type == "TABLE" {
+				return k.Mode
+			}
+		}
+		return ""
+	}
+	s.Do("SET autocommit = 0")
+	for _, c := range []struct{ setting, stmt, want string }{
+		{"1", "LOCK TABLES t READ", "S"},
+		{"0", "LOCK TABLES t READ", ""},
+		{"1", "LOCK TABLES t WRITE", "X"},
+		{"0", "LOCK TABLES t WRITE", ""},
+	} {
+		s.Do("SET SESSION innodb_table_locks = " + c.setting)
+		s.Do(c.stmt)
+		got := innodbTableLock()
+		L.Note("innodb_table_locks = %s, %s → InnoDB table lock %q", c.setting, c.stmt, got)
+		if got != c.want {
+			t.Errorf("innodb_table_locks = %s, %s: InnoDB table lock %q, want %q", c.setting, c.stmt, got, c.want)
+		}
+		s.Do("COMMIT")
+		s.Do("UNLOCK TABLES")
+	}
+
+	other.Do("START TRANSACTION")
+	other.Do("UPDATE t SET v = 1 WHERE id = 10")
+	lock := s.Do("LOCK TABLES t READ").MustBlock()
+	state := L.QueryString("SELECT STATE FROM performance_schema.processlist WHERE ID = ?", s.ID)
+	L.Note("innodb_table_locks = 0, waiting in state %q", state)
+	if state != "Waiting for table metadata lock" {
+		t.Fatalf("waiting in state %q, want the metadata lock", state)
+	}
+	other.Do("COMMIT")
+	lock.MustOK()
+	s.Do("UNLOCK TABLES")
+}
+
+// 17.7.2.1: READ COMMITTED supports only row-based binary logging. With
+// binlog_format = STATEMENT an InnoDB write under READ COMMITTED fails (ERROR 1665); with
+// MIXED the server logs it as row events, while the same UPDATE under REPEATABLE READ is
+// logged as a statement.
+func TestTx_ReadCommittedRequiresRowBinlog(t *testing.T) {
+	L := newLab(t)
+	if L.QueryString("SELECT @@log_bin") != "1" {
+		t.Skip("binary logging is off")
+	}
+	setupT(L)
+	s := L.Session("S")
+	s.Do("SET SESSION binlog_format = 'STATEMENT'")
+	s.Begin(lab.ReadCommitted)
+	s.Do("UPDATE t SET v = v + 1 WHERE id = 10").MustFail(func(err error) bool { return lab.Code(err) == "1665" })
+	s.Do("ROLLBACK")
+	s.Begin(lab.RepeatableRead)
+	s.Do("UPDATE t SET v = v + 1 WHERE id = 10").MustOK()
+	s.Do("COMMIT")
+
+	s.Do("SET SESSION binlog_format = 'MIXED'")
+	for _, c := range []struct {
+		level lab.Level
+		event string
+	}{{lab.RepeatableRead, "Query"}, {lab.ReadCommitted, "Update_rows"}} {
+		pos := L.Query("SHOW BINARY LOG STATUS")[0]
+		s.Begin(c.level)
+		s.Do("UPDATE t SET v = v + 1 WHERE id = 20").MustOK()
+		s.Do("COMMIT")
+		var types []string
+		for _, e := range L.Query("SHOW BINLOG EVENTS IN '" + pos[0] + "' FROM " + pos[1]) {
+			if e[2] == "Query" && !strings.Contains(e[5], "UPDATE") {
+				continue // BEGIN / COMMIT markers
+			}
+			if e[2] == "Query" || strings.HasSuffix(e[2], "_rows") {
+				types = append(types, e[2])
+			}
+		}
+		L.Note("binlog_format = MIXED, %s: UPDATE logged as %v", c.level, types)
+		if !slices.Equal(types, []string{c.event}) {
+			t.Errorf("%s: UPDATE logged as %v, want [%s]", c.level, types, c.event)
+		}
+	}
+}
+
+// 17.7.2.1 / 17.7.2.4: DML that only reads the grant tables in mysql takes no locks on them,
+// at any isolation level (even where reads of ordinary tables lock, as in SERIALIZABLE or
+// INSERT ... SELECT).
+func TestLock_GrantTablesAreReadWithoutLocks(t *testing.T) {
+	L := newLab(t)
+	setupT(L)
+	L.Exec("DROP TABLE IF EXISTS dst", "CREATE TABLE dst (u varchar(64))")
+	s := L.Session("S")
+	check := func(what string) {
+		t.Helper()
+		var onUser, onT int
+		for _, k := range L.ShowLocks() {
+			switch {
+			case strings.HasPrefix(k.Object, "user"):
+				onUser++
+			case strings.HasPrefix(k.Object, "t"):
+				onT++
+			}
+		}
+		L.Note("%s: %d lock(s) on t, %d on mysql.user", what, onT, onUser)
+		if onUser != 0 {
+			t.Errorf("%s: %d lock(s) on mysql.user", what, onUser)
+		}
+	}
+	s.Begin(lab.Serializable)
+	s.Do("SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM mysql.user WHERE user = 'root')").MustOK()
+	check("SERIALIZABLE SELECT joining mysql.user")
+	s.Do("ROLLBACK")
+	s.Begin(lab.RepeatableRead)
+	s.Do("INSERT INTO dst SELECT user FROM mysql.user").MustOK()
+	check("INSERT ... SELECT FROM mysql.user")
+	s.Do("ROLLBACK")
+}
+
+// 17.7.2.4: FOR SHARE needs the SELECT privilege; FOR UPDATE needs SELECT plus at least one
+// of DELETE, LOCK TABLES or UPDATE.
+func TestLock_LockingReadPrivileges(t *testing.T) {
+	L := newLab(t)
+	setupT(L)
+	L.Exec("DROP USER IF EXISTS labro", "CREATE USER labro IDENTIFIED BY 'ro'",
+		"GRANT SELECT ON "+dbname+".t TO labro")
+	t.Cleanup(func() { _, _ = L.Admin.Exec("DROP USER IF EXISTS labro") })
+	db, err := sql.Open("mysql", lab.DSNAs(lab.MySQL, dbname, "labro", "ro"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// Database-level grants (LOCK TABLES ON db.*) only apply to new connections, so never reuse one.
+	db.SetMaxIdleConns(0)
+	try := func(q string) error {
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		rows, err := tx.Query(q)
+		if err == nil {
+			rows.Close()
+		}
+		return err
+	}
+	if err := try("SELECT * FROM t WHERE id = 10 FOR SHARE"); err != nil {
+		t.Fatalf("FOR SHARE with SELECT only: %v", err)
+	}
+	err = try("SELECT * FROM t WHERE id = 10 FOR UPDATE")
+	L.Note("FOR UPDATE with SELECT only: %v", lab.Describe(err))
+	if lab.Code(err) != "1142" {
+		t.Fatalf("FOR UPDATE with SELECT only: got %v, want ERROR 1142", err)
+	}
+	for _, grant := range []string{"UPDATE ON " + dbname + ".t", "DELETE ON " + dbname + ".t", "LOCK TABLES ON " + dbname + ".*"} {
+		L.Exec("REVOKE ALL PRIVILEGES, GRANT OPTION FROM labro", "GRANT SELECT ON "+dbname+".t TO labro", "GRANT "+grant+" TO labro")
+		if err := try("SELECT * FROM t WHERE id = 10 FOR UPDATE"); err != nil {
+			t.Errorf("FOR UPDATE with SELECT + %s: %v", grant, err)
+		} else {
+			L.Note("FOR UPDATE with SELECT + %s: ok", strings.Fields(grant)[0])
+		}
+	}
 }

@@ -743,3 +743,32 @@ func TestMVCC_CatalogAccessIgnoresSnapshot(t *testing.T) {
 	rd.Do("SELECT count(*) FROM pg_class WHERE relname = 'newt'").MustRows("(0)")
 	rd.Do("COMMIT")
 }
+
+// 13.4.1: the docs' advice for relying on SERIALIZABLE: make it the default
+// (default_transaction_isolation) and guard against transactions at other levels, for
+// example with a trigger that checks transaction_isolation.
+func TestIso_DefaultSerializableAndTriggerGuard(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS guarded", "CREATE TABLE guarded (id int primary key)",
+		`CREATE OR REPLACE FUNCTION require_serializable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_setting('transaction_isolation') <> 'serializable' THEN
+    RAISE EXCEPTION 'writes to % must run at SERIALIZABLE, not %', TG_TABLE_NAME, current_setting('transaction_isolation');
+  END IF;
+  RETURN NEW;
+END $$`,
+		"CREATE TRIGGER guard BEFORE INSERT OR UPDATE OR DELETE ON guarded FOR EACH ROW EXECUTE FUNCTION require_serializable()")
+	s := L.Session("S")
+	s.Do("BEGIN")
+	s.Do("INSERT INTO guarded VALUES (1)").MustFail(hasMessage("must run at SERIALIZABLE, not read committed"))
+	s.Do("ROLLBACK")
+
+	s.Do("SET default_transaction_isolation = 'serializable'")
+	s.Do("BEGIN")
+	s.Do("SHOW transaction_isolation").MustRows("(serializable)")
+	s.Do("INSERT INTO guarded VALUES (1)").MustOK()
+	s.Do("COMMIT")
+	L.Note("an autocommit statement is a transaction too, and uses the default")
+	s.Do("INSERT INTO guarded VALUES (2)").MustOK()
+	s.Do("SELECT count(*) FROM guarded").MustRows("(2)")
+}

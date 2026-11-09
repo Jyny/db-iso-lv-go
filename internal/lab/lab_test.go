@@ -170,3 +170,14 @@ func TestQuietDropsUnblockMessages(t *testing.T) {
 		t.Fatalf("%d message(s) from the quiet period still pending", n)
 	}
 }
+
+func TestDSNAs(t *testing.T) {
+	t.Setenv("LAB_PG_DSN", "postgres://postgres:lab@h:1/%s?sslmode=disable")
+	t.Setenv("LAB_MYSQL_DSN", "root:lab@tcp(h:1)/%s")
+	if got, want := DSNAs(Postgres, "x", "u", "p"), "postgres://u:p@h:1/x?sslmode=disable&default_query_exec_mode=simple_protocol"; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+	if got, want := DSNAs(MySQL, "x", "u", "p"), "u:p@tcp(h:1)/x?interpolateParams=true&parseTime=true"; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}

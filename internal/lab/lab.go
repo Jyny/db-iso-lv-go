@@ -98,6 +98,18 @@ func dsn(kind Kind, dbname string) string {
 	panic("unknown kind " + kind)
 }
 
+// DSNAs returns the DSN of database dbname with the user and password replaced, for
+// experiments that need a connection with fewer privileges.
+func DSNAs(kind Kind, dbname, user, password string) string {
+	d := dsn(kind, dbname)
+	at := strings.Index(d, "@")
+	start := 0
+	if kind == Postgres {
+		start = strings.Index(d, "://") + 3
+	}
+	return d[:start] + user + ":" + password + d[at:]
+}
+
 // withParams appends query parameters to a DSN that may or may not already have some.
 func withParams(dsn, params string) string {
 	if strings.Contains(dsn, "?") {
