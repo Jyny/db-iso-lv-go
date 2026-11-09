@@ -102,11 +102,12 @@ func dsn(kind Kind, dbname string) string {
 // experiments that need a connection with fewer privileges.
 func DSNAs(kind Kind, dbname, user, password string) string {
 	d := dsn(kind, dbname)
-	at := strings.Index(d, "@")
 	start := 0
 	if kind == Postgres {
 		start = strings.Index(d, "://") + 3
 	}
+	// The credentials end at the LAST '@' before the path: a password may contain '@'.
+	at := start + strings.LastIndex(d[start:start+strings.Index(d[start:], "/")], "@")
 	return d[:start] + user + ":" + password + d[at:]
 }
 

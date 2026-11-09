@@ -180,4 +180,45 @@ func TestDSNAs(t *testing.T) {
 	if got, want := DSNAs(MySQL, "x", "u", "p"), "u:p@tcp(h:1)/x?interpolateParams=true&parseTime=true"; got != want {
 		t.Errorf("got %s, want %s", got, want)
 	}
+	t.Setenv("LAB_MYSQL_DSN", "root:p@ss@tcp(h:1)/%s")
+	if got, want := DSNAs(MySQL, "x", "u", "p"), "u:p@tcp(h:1)/x?interpolateParams=true&parseTime=true"; got != want {
+		t.Errorf("password with '@': got %s, want %s", got, want)
+	}
+}
+
+// PG's END is COMMIT. Missing it left the session "in a transaction", so a later autocommit
+// error put it in skip mode and the statements after it were silently not run.
+func TestPGEndEndsTx(t *testing.T) {
+	L := New(t, Postgres, testDB)
+	s := L.Session("T1")
+	s.Do("BEGIN")
+	s.Do("SELECT 1")
+	s.Do("END").MustOK()
+	s.Do("SELECT 1/0").MustFail(nil)
+	if op := s.Do("SELECT 1").MustOK(); op.Skipped {
+		t.Fatal("statement after an autocommit error was skipped")
+	}
+}
+
+// MySQL commits implicitly before DDL and LOCK TABLES, even if the statement then fails.
+func TestMySQLImplicitCommitEndsTx(t *testing.T) {
+	L := New(t, MySQL, testDB)
+	L.Exec("DROP TABLE IF EXISTS ic", "CREATE TABLE ic (id int primary key)")
+	s := L.Session("T1")
+	for _, q := range []string{"CREATE TABLE IF NOT EXISTS ic (id int primary key)", "ALTER TABLE nosuch ADD c int", "LOCK TABLES ic READ"} {
+		s.Do("START TRANSACTION")
+		s.Do("INSERT INTO ic VALUES (1)")
+		s.Do(q)
+		s.Do("UNLOCK TABLES")
+		s.mu.Lock()
+		inTx := s.inTx
+		s.mu.Unlock()
+		if inTx {
+			t.Errorf("%q: session still considered in a transaction after an implicit commit", q)
+		}
+		if n := L.QueryString("SELECT count(*) FROM ic"); n != "1" {
+			t.Fatalf("%q: the INSERT was not committed (count %s)", q, n)
+		}
+		L.Exec("DELETE FROM ic")
+	}
 }

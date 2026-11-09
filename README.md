@@ -11,7 +11,7 @@ Every conclusion is backed by a test; run it with `-v` to see the full timeline 
 
 ```bash
 make up          # docker-compose starts PG (55432) + MySQL (53306)
-make test        # all experiments (314 tests, about 70 seconds)
+make test        # all experiments (316 tests, about 70 seconds)
 make hermitage   # isolation-level anomaly matrix
 go test -p 1 -count=1 -v ./mysql -run 'TestLock_GapLockOnMissingKey'   # timeline of one experiment
 ```
@@ -24,7 +24,7 @@ go test -p 1 -count=1 -v ./mysql -run 'TestLock_GapLockOnMissingKey'   # timelin
 - `s.Do(sql)`: returns the result when the statement finishes. If it gets stuck on a lock, the harness **asks the DB to confirm it is really waiting for a lock** and returns immediately (`op.Blocked = true`), so the test can keep driving other sessions. When the statement is later unblocked, `↳ #N done` is printed.
 - After every step the harness waits until every session is quiescent (idle, or confirmed waiting for a lock), so interleavings are **deterministic** without guessing with `sleep`.
 - Lock-wait detection: PG uses `pg_stat_activity.wait_event_type = 'Lock'` (plus `wait_event = 'SafeSnapshot'`, a `READ ONLY DEFERRABLE` transaction waiting for its snapshot); MySQL uses `performance_schema.data_lock_waits` plus the MDL wait states in the processlist.
-- Transaction tracking: after a deadlock (and, on PG, after any error inside a transaction), later statements are skipped until the transaction ends, so nothing silently runs in autocommit mode. `ROLLBACK TO SAVEPOINT` runs normally and does not end the transaction.
+- Transaction tracking: after a deadlock (and, on PG, after any error inside a transaction), later statements are skipped until the transaction ends, so nothing silently runs in autocommit mode. The end is recognized from `COMMIT` / `ROLLBACK` / `ABORT` / PG's `END` and `PREPARE TRANSACTION`, and from MySQL's implicit commits (DDL, `LOCK TABLES`). `ROLLBACK TO SAVEPOINT` runs normally and does not end the transaction.
 
 Example timeline (`go test ./postgres -v -run DDLLockQueue`):
 

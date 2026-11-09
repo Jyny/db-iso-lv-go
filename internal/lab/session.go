@@ -303,8 +303,28 @@ func isTxStart(q string) bool {
 
 func isTxEnd(q string) bool {
 	u := strings.ToUpper(strings.TrimSpace(q))
+	f := strings.Fields(u)
 	return strings.HasPrefix(u, "COMMIT") || strings.HasPrefix(u, "ABORT") ||
-		strings.HasPrefix(u, "ROLLBACK") && !isRollbackToSavepoint(q)
+		strings.HasPrefix(u, "ROLLBACK") && !isRollbackToSavepoint(q) ||
+		len(f) > 0 && strings.TrimSuffix(f[0], ";") == "END" || // PG: END = COMMIT
+		strings.HasPrefix(u, "PREPARE TRANSACTION") // PG: the session leaves the transaction
+}
+
+// commitsImplicitly reports whether MySQL commits the open transaction before running q
+// (DDL and LOCK TABLES), which it does even when q then fails.
+// https://dev.mysql.com/doc/refman/8.4/en/implicit-commit.html
+func commitsImplicitly(q string) bool {
+	f := strings.Fields(strings.ToUpper(q))
+	if len(f) < 2 || f[1] == "TEMPORARY" {
+		return false
+	}
+	switch f[0] {
+	case "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME":
+		return true
+	case "LOCK":
+		return f[1] == "TABLES" || f[1] == "TABLE"
+	}
+	return false
 }
 
 // isRollbackToSavepoint matches ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name,
@@ -354,9 +374,10 @@ func (s *Session) run(op *Op) {
 			s.mu.Unlock()
 			op.Skipped, op.Err = true, abortErr
 			return
-		case s.lab.Kind == MySQL && (isTxStart(op.SQL) || isSetTransaction(op.SQL)):
+		case s.lab.Kind == MySQL && (isTxStart(op.SQL) || isSetTransaction(op.SQL) || commitsImplicitly(op.SQL)):
 			// On MySQL the aborted transaction is already gone, so the application starting
-			// its retry (SET TRANSACTION / START TRANSACTION) begins a fresh one; run it.
+			// its retry (SET TRANSACTION / START TRANSACTION) begins a fresh one, and a
+			// statement that commits implicitly runs outside it anyway; run them.
 			// (On PG the session stays in the aborted transaction until ROLLBACK.)
 			s.mu.Lock()
 			s.abortErr, s.inTx = nil, false
@@ -389,7 +410,7 @@ func (s *Session) run(op *Op) {
 	switch {
 	case isTxStart(op.SQL) && op.Err == nil:
 		s.inTx = true
-	case isTxEnd(op.SQL):
+	case isTxEnd(op.SQL), s.lab.Kind == MySQL && commitsImplicitly(op.SQL):
 		s.inTx = false
 	case isRollbackToSavepoint(op.SQL) && op.Err == nil:
 		s.abortErr = nil
