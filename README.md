@@ -11,7 +11,7 @@
 
 ```bash
 make up          # docker-compose 起 PG(55432) + MySQL(53306)
-make test        # 全部實驗（約 40 秒）
+make test        # 全部實驗（約 50 秒）
 make hermitage   # 隔離等級異常矩陣
 go test -p 1 -count=1 -v ./mysql -run 'TestLock_GapLockOnMissingKey'   # 看單一實驗的時間軸
 ```
@@ -231,20 +231,20 @@ Hermitage 是「人工挑好的一種交錯」；[Jepsen](https://github.com/jep
 
 | DB | Level | commits | retries | unstable reads（兩次加總不同） | 讀到總額 ≠ 500 | 最終總額 |
 |---|---|---|---|---|---|---|
-| postgres | RU | 1590 | 20 | 53 / 1501 | 1394 / 1501 | 530 ✗ |
-| postgres | RC | 1478 | 21 | 32 / 1430 | 1430 / 1430 | 449 ✗ |
-| postgres | RR | 1410 | 489 | **0** | **0** | **500** |
-| postgres | SER | 1507 | 389 | **0** | **0** | **500** |
-| mysql | RU | 2442 | 83 | 595 / 825 | 823 / 825 | 7 ✗ |
-| mysql | RC | 1827 | 74 | 776 / 885 | 881 / 885 | 1858 ✗ |
-| mysql | RR | 1915 | 86 | **0** | 915 / 920 | **27559 ✗** |
-| mysql | SER | 608 | 1715 | **0** | **0** | **500** |
+| postgres | RU | 1575 | 21 | 39 / 1511 | 1409 / 1511 | 741 ✗ |
+| postgres | RC | 1609 | 25 | 47 / 1520 | 1519 / 1520 | 804 ✗ |
+| postgres | RR | 1455 | 457 | **0** | **0** | **500** |
+| postgres | SER | 1546 | 566 | **0** | **0** | **500** |
+| mysql | RU | 2441 | 80 | 607 / 845 | 845 / 845 | 4 ✗ |
+| mysql | RC | 1934 | 107 | 813 / 937 | 934 / 937 | 290000 ✗ |
+| mysql | RR | 1964 | 91 | **0** | 918 / 925 | **2739 ✗** |
+| mysql | SER | 615 | 1665 | **0** | **0** | **500** |
 
-（每格跑 1.5 秒，數字每次不同，但 ✗ 的模式很穩定。）
+（每格跑 1.5 秒，數字每次不同，但 ✗ 的模式很穩定：連續 4 次乾淨重跑，PG RR/SER 與 MySQL SER 每次都是 0 / 0 / 500，MySQL RR 每次都是 unstable 0、最終總額偏離 500。）
 
-- **MySQL RR 最值得看**：unstable reads = 0，快照完全一致；但總額從 500 漂到 27559，因為 RR 不擋 lost update（Hermitage P4）。「快照一致」不等於「資料正確」。
-- **PG RR 靠 abort 保住正確性**：489 次重試換來總額不變（first-updater-wins）。
-- **MySQL SER 靠鎖**：正確，但 1715 次死鎖重試，commits 只有其他等級的 1/3。這就是 SERIALIZABLE-by-locking 的代價。
+- **MySQL RR 最值得看**：unstable reads = 0，快照完全一致；但總額從 500 漂到 2739，因為 RR 不擋 lost update（Hermitage P4）。「快照一致」不等於「資料正確」。
+- **PG RR 靠 abort 保住正確性**：457 次重試換來總額不變（first-updater-wins）。
+- **MySQL SER 靠鎖**：正確，但 1665 次死鎖重試，commits 只有其他等級的 1/3。這就是 SERIALIZABLE-by-locking 的代價。
 - 弱等級的異常是機率性的，測試只對「有保證的等級」（PG RR/SER、MySQL SER）做斷言，弱等級只回報。
 
 ---

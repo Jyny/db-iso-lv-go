@@ -301,7 +301,21 @@ func isTxStart(q string) bool {
 
 func isTxEnd(q string) bool {
 	u := strings.ToUpper(strings.TrimSpace(q))
-	return strings.HasPrefix(u, "COMMIT") || strings.HasPrefix(u, "ROLLBACK") || strings.HasPrefix(u, "ABORT")
+	return strings.HasPrefix(u, "COMMIT") || strings.HasPrefix(u, "ABORT") ||
+		strings.HasPrefix(u, "ROLLBACK") && !isRollbackToSavepoint(q)
+}
+
+// isRollbackToSavepoint matches ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name,
+// which undoes part of the transaction but does not end it.
+func isRollbackToSavepoint(q string) bool {
+	f := strings.Fields(strings.ToUpper(q))
+	if len(f) < 3 || f[0] != "ROLLBACK" {
+		return false
+	}
+	if f[1] == "WORK" || f[1] == "TRANSACTION" {
+		f = f[1:]
+	}
+	return f[1] == "TO"
 }
 
 func isSetTransaction(q string) bool {
@@ -345,6 +359,9 @@ func (s *Session) run(op *Op) {
 			s.mu.Lock()
 			s.abortErr, s.inTx = nil, false
 			s.mu.Unlock()
+		case s.lab.Kind == Postgres && isRollbackToSavepoint(op.SQL):
+			// PG leaves the aborted state by rolling back to a savepoint taken before the error.
+			// (On MySQL a deadlock already rolled back the whole transaction, savepoints included.)
 		default:
 			op.Skipped, op.Err = true, abortErr
 			return
@@ -372,6 +389,8 @@ func (s *Session) run(op *Op) {
 		s.inTx = true
 	case isTxEnd(op.SQL):
 		s.inTx = false
+	case isRollbackToSavepoint(op.SQL) && op.Err == nil:
+		s.abortErr = nil
 	case op.Err != nil && s.inTx && s.abortsTx(op.Err):
 		s.abortErr = op.Err
 	}

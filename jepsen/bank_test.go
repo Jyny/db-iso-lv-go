@@ -13,9 +13,10 @@
 //     (non-repeatable / skewed reads)
 //   - wrong totals: a read summed to something other than the initial total → money was
 //     created or destroyed by lost updates (or a skewed read saw a half-done transfer)
-//   - final total ≠ initial total → lost updates really happened Transactions that fail with a
+//   - final total ≠ initial total → lost updates really happened
 //
-// deadlock or serialization failure are retried, as a real application must.
+// Transactions that fail with a deadlock or serialization failure are retried, as a real
+// application must.
 //
 // Run: go test ./jepsen -v -count=1
 package jepsen

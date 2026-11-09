@@ -118,3 +118,55 @@ func TestExpectOneDeadlockVictimIgnoresSkipped(t *testing.T) {
 		t.Fatalf("victim should be the UPDATE, got %q", v.SQL)
 	}
 }
+
+// ROLLBACK TO SAVEPOINT recovers from an error inside the transaction; it does not end it.
+// It must run (not be replaced by a full ROLLBACK), and the session must still be in a
+// transaction afterwards, so a later deadlock still enters skip mode.
+func TestRollbackToSavepointKeepsTx(t *testing.T) {
+	for _, kind := range []Kind{Postgres, MySQL} {
+		t.Run(kind.String(), func(t *testing.T) {
+			L := New(t, kind, testDB)
+			L.Exec("DROP TABLE IF EXISTS sp", "CREATE TABLE sp (id int primary key)")
+			s := L.Session("T1")
+			s.Do("BEGIN")
+			s.Do("INSERT INTO sp VALUES (1)").MustOK()
+			s.Do("SAVEPOINT a")
+			s.Do("INSERT INTO sp VALUES (1)").MustFail(IsUniqueViolation)
+			if op := s.Do("ROLLBACK TO SAVEPOINT a").MustOK(); op.Skipped {
+				t.Fatal("ROLLBACK TO SAVEPOINT was skipped")
+			}
+			s.mu.Lock()
+			inTx := s.inTx
+			s.mu.Unlock()
+			if !inTx {
+				t.Fatal("session no longer considered in a transaction after ROLLBACK TO SAVEPOINT")
+			}
+			s.Do("INSERT INTO sp VALUES (2)").MustOK()
+			s.Do("COMMIT").MustOK()
+			if got := L.QueryString("SELECT count(*) FROM sp"); got != "2" {
+				t.Fatalf("committed %s row(s), want 2", got)
+			}
+		})
+	}
+}
+
+// "↳ done" lines of statements unblocked while the timeline is quiet must not be
+// printed later, after Loud(), as if they belonged to an unrelated step.
+func TestQuietDropsUnblockMessages(t *testing.T) {
+	L := New(t, Postgres, testDB)
+	L.Exec("DROP TABLE IF EXISTS q", "CREATE TABLE q (id int primary key, v int)", "INSERT INTO q VALUES (1, 0)")
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	L.Quiet()
+	t1.Do("BEGIN")
+	t1.Do("UPDATE q SET v = 1 WHERE id = 1")
+	p := t2.Do("UPDATE q SET v = 2 WHERE id = 1").MustBlock()
+	t1.Do("COMMIT")
+	p.Wait()
+	L.Loud()
+	L.mu.Lock()
+	n := len(L.deferred)
+	L.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d message(s) from the quiet period still pending", n)
+	}
+}

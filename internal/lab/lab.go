@@ -172,7 +172,7 @@ type Lab struct {
 	mu       sync.Mutex
 	seq      int
 	sessions []*Session
-	quiet    bool
+	quiet    bool     // guarded by mu: deferLine runs on worker goroutines
 	deferred []string // "unblocked" messages, printed after the step that caused them
 	history  []*Op
 }
@@ -184,10 +184,20 @@ func New(t testing.TB, kind Kind, dbname string) *Lab {
 	return &Lab{T: t, Kind: kind, Admin: openPool(t, kind, dbname)}
 }
 
-// Quiet disables timeline output; Loud re-enables it.
-func (l *Lab) Quiet() { l.quiet = true }
+// Quiet disables timeline output; Loud re-enables it. "↳ done" messages of statements
+// unblocked while quiet are dropped, not printed after Loud as part of a later step.
+func (l *Lab) Quiet() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.flushLocked()
+	l.quiet = true
+}
 
-func (l *Lab) Loud() { l.quiet = false }
+func (l *Lab) Loud() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.quiet = false
+}
 
 // History returns every op issued in this experiment, in issue order.
 func (l *Lab) History() []*Op {
@@ -197,22 +207,22 @@ func (l *Lab) History() []*Op {
 }
 
 func (l *Lab) printf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.quiet {
 		return
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.flushLocked()
 	fmt.Fprintf(l.T.Output(), format+"\n", args...)
 }
 
 // printStep prints a step's line, then any "unblocked" messages the step caused.
 func (l *Lab) printStep(line string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.quiet {
 		return
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	fmt.Fprintln(l.T.Output(), line)
 	l.flushLocked()
 }
@@ -220,15 +230,18 @@ func (l *Lab) printStep(line string) {
 func (l *Lab) deferLine(line string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.quiet {
+		return
+	}
 	l.deferred = append(l.deferred, line)
 }
 
 func (l *Lab) flush() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.quiet {
 		return
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.flushLocked()
 }
 

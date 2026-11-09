@@ -121,6 +121,9 @@ func (l *Lab) ShowLocks() []Lock {
 // performance_schema.metadata_locks rather than data_locks.
 func (l *Lab) ShowMetadataLocks() [][]string {
 	l.T.Helper()
+	if len(l.sessions) == 0 {
+		return nil
+	}
 	names := map[string]string{}
 	var ids []string
 	for _, s := range l.sessions {
