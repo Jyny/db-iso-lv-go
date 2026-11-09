@@ -1,31 +1,32 @@
-# db-iso-lv-go — PostgreSQL 18 / MySQL 9.7 隔離等級、MVCC、鎖與死鎖實驗室
+# db-iso-lv-go — PostgreSQL 18 / MySQL 9.7 isolation level, MVCC, lock and deadlock lab
 
-用 Go 測試把「教科書上的交錯執行」變成**可重跑、可自動判定**的實驗。
-每個結論都對應一個測試，用 `-v` 跑就能看到完整時間軸與 DB 內部狀態（`pg_locks`、`pageinspect`、`performance_schema.data_locks`…）。
+Go tests that turn "textbook interleavings" into experiments that are **re-runnable and checked automatically**.
+Every conclusion is backed by a test; run it with `-v` to see the full timeline and the DB's internal state (`pg_locks`, `pageinspect`, `performance_schema.data_locks`, …).
 
-| 元件 | 版本（2026-11 最新穩定版） |
+| Component | Version (latest stable, 2026-11) |
 |---|---|
-| PostgreSQL | **18.6**（19 仍是 rc） |
-| MySQL | **9.7.4 LTS**（26.x 是 innovation release） |
-| Go | 1.27，驅動：pgx v5、go-sql-driver/mysql |
+| PostgreSQL | **18.6** (19 is still an rc) |
+| MySQL | **9.7.4 LTS** (26.x is an innovation release) |
+| Go | 1.27, drivers: pgx v5, go-sql-driver/mysql |
 
 ```bash
-make up          # docker-compose 起 PG(55432) + MySQL(53306)
-make test        # 全部實驗（約 50 秒）
-make hermitage   # 隔離等級異常矩陣
-go test -p 1 -count=1 -v ./mysql -run 'TestLock_GapLockOnMissingKey'   # 看單一實驗的時間軸
+make up          # docker-compose starts PG (55432) + MySQL (53306)
+make test        # all experiments (about 50 seconds)
+make hermitage   # isolation-level anomaly matrix
+go test -p 1 -count=1 -v ./mysql -run 'TestLock_GapLockOnMissingKey'   # timeline of one experiment
 ```
 
 ---
 
-## 0. 實驗框架怎麼運作（`internal/lab`）
+## 0. How the harness works (`internal/lab`)
 
-- 每個 `Session` = 一條專屬連線 + 一個 worker goroutine。
-- `s.Do(sql)`：指令完成就回傳結果；若被鎖擋住，框架**向 DB 確認它真的在等鎖**後立即回傳（`op.Blocked = true`），測試可繼續操作其它 session。之後解除阻塞會印出 `↳ #N done`。
-- 每一步之後等待所有 session「靜止」（閒置或確定在等鎖），所以交錯順序是**決定性的**，不靠 `sleep` 猜時間。
-- 等鎖偵測：PG 看 `pg_stat_activity.wait_event_type = 'Lock'`；MySQL 看 `performance_schema.data_lock_waits` + processlist 的 MDL 等待狀態。
+- Each `Session` = one dedicated connection + one worker goroutine.
+- `s.Do(sql)`: returns the result when the statement finishes. If it gets stuck on a lock, the harness **asks the DB to confirm it is really waiting for a lock** and returns immediately (`op.Blocked = true`), so the test can keep driving other sessions. When the statement is later unblocked, `↳ #N done` is printed.
+- After every step the harness waits until every session is quiescent (idle, or confirmed waiting for a lock), so interleavings are **deterministic** without guessing with `sleep`.
+- Lock-wait detection: PG uses `pg_stat_activity.wait_event_type = 'Lock'`; MySQL uses `performance_schema.data_lock_waits` plus the MDL wait states in the processlist.
+- Transaction tracking: after a deadlock (and, on PG, after any error inside a transaction), later statements are skipped until the transaction ends, so nothing silently runs in autocommit mode. `ROLLBACK TO SAVEPOINT` runs normally and does not end the transaction.
 
-時間軸範例（`go test ./postgres -v -run DDLLockQueue`）：
+Example timeline (`go test ./postgres -v -run DDLLockQueue`):
 
 ```
   1  TX │ BEGIN
@@ -35,7 +36,7 @@ go test -p 1 -count=1 -v ./mysql -run 'TestLock_GapLockOnMissingKey'   # 看單�
      ┌─ pg_locks
      │ TX  relation      q          AccessShareLock          GRANTED
      │ DDL relation      q          AccessExclusiveLock      WAITING
-     │ RD  relation      q          AccessShareLock          WAITING   ← 排在 DDL 後面！
+     │ RD  relation      q          AccessShareLock          WAITING   ← queued behind the DDL!
      └─
   5  TX │ COMMIT
          DDL │ ↳ #3 done (waited 422ms)
@@ -46,91 +47,91 @@ go test -p 1 -count=1 -v ./mysql -run 'TestLock_GapLockOnMissingKey'   # 看單�
 
 ## 1. MVCC under the hood
 
-兩者都是 MVCC，但「舊版本放哪裡」完全相反，這決定了後面幾乎所有行為差異。
+Both are MVCC, but they keep old versions in opposite places, and that explains almost every behavioral difference that follows.
 
 | | PostgreSQL | MySQL InnoDB |
 |---|---|---|
-| 舊版本存放 | **在 heap 本身**：UPDATE = 寫一個新 tuple + 在舊 tuple 填 `xmax` | **在 undo log**：聚簇索引只放最新版，舊版靠 `DB_ROLL_PTR` 串成鏈 |
-| 每列的版本資訊 | `xmin`（建立者）、`xmax`（刪除/鎖定者）、`ctid`、infomask hint bits | 隱藏欄位 `DB_TRX_ID`（最後寫入者）、`DB_ROLL_PTR` |
-| 快照 | `pg_current_snapshot()` = `xmin:xmax:xip[]` | Read View = `m_low_limit_id / m_up_limit_id / m_ids[]` |
-| 快照建立時機（RR） | 第一個語句 | 第一個 consistent read（或 `WITH CONSISTENT SNAPSHOT`） |
-| 回收舊版本 | `VACUUM`（會被長交易擋住 → 表膨脹） | purge thread（會被長 read view 擋住 → history list 變長） |
-| 列鎖存放 | **tuple header 本身**（`xmax` + infomask；多人共享時變 MultiXact） | 記憶體中的 lock system（`data_locks`），新插入的列是「隱式鎖」 |
-| UPDATE / DELETE 讀哪個版本 | **快照**（RC 會在等鎖後 re-check 最新版：EvalPlanQual） | **current read**：永遠讀最新 committed 版本並上鎖 |
+| Where old versions live | **In the heap itself**: UPDATE = write a new tuple + set `xmax` on the old one | **In the undo log**: the clustered index holds only the latest version; older ones are chained via `DB_ROLL_PTR` |
+| Per-row version info | `xmin` (creator), `xmax` (deleter / locker), `ctid`, infomask hint bits | Hidden columns `DB_TRX_ID` (last writer), `DB_ROLL_PTR` |
+| Snapshot | `pg_current_snapshot()` = `xmin:xmax:xip[]` | Read View = `m_low_limit_id / m_up_limit_id / m_ids[]` |
+| When the snapshot is taken (RR) | First statement | First consistent read (or `WITH CONSISTENT SNAPSHOT`) |
+| Reclaiming old versions | `VACUUM` (held back by long transactions → table bloat) | Purge thread (held back by long read views → history list grows) |
+| Where row locks live | **In the tuple header** (`xmax` + infomask; a MultiXact when shared) | In-memory lock system (`data_locks`); freshly inserted rows have "implicit locks" |
+| Which version UPDATE / DELETE read | **The snapshot** (RC re-checks the latest version after a lock wait: EvalPlanQual) | **Current read**: always the latest committed version, locked |
 
-### PostgreSQL（`postgres/mvcc_test.go`）
+### PostgreSQL (`postgres/mvcc_test.go`)
 
-| 實驗 | 你會看到 |
+| Experiment | What you see |
 |---|---|
-| `TestMVCC_UpdateCreatesNewTupleVersion` | `pageinspect` 顯示同一頁上兩個版本：舊的 `t_xmax = 更新者 xid`、`t_ctid → (0,2)`、`hot = true`。VACUUM 後 lp 1 變成 `redirect`（HOT chain）。 |
-| `TestMVCC_RollbackLeavesTupleOnDisk` | ROLLBACK 的 INSERT **仍在磁碟上**，第一次被讀到時設 `xmin_a`（aborted）hint bit。 |
-| `TestMVCC_SnapshotTakenAtFirstStatement` | `BEGIN` 之後、第一個 SELECT 之前提交的資料**看得到**；快照 `4238:4240:4238` 的 xip 就是仍在進行的 T3。 |
-| `TestMVCC_OldSnapshotBlocksVacuum` | 開著一個 RR 交易時更新 5 次 → VACUUM 後 6 個版本**全留著**；交易結束後 VACUUM 才清掉。 |
-| `TestMVCC_RowLocksLiveInTupleHeader` | `FOR SHARE` 後 `t_xmax = 鎖定者 xid`（沒刪任何東西）；兩人共享鎖 → `pgrowlocks` 顯示 `multi = true, xids = {a,b}`。 |
+| `TestMVCC_UpdateCreatesNewTupleVersion` | `pageinspect` shows two versions on the same page: the old one has `t_xmax = updater's xid`, `t_ctid → (0,2)`, `hot = true`. After VACUUM, lp 1 becomes a `redirect` (HOT chain). |
+| `TestMVCC_RollbackLeavesTupleOnDisk` | A rolled-back INSERT **is still on disk**; the first read sets the `xmin_a` (aborted) hint bit. |
+| `TestMVCC_SnapshotTakenAtFirstStatement` | Data committed after `BEGIN` but before the first SELECT **is visible**; in the snapshot `4238:4240:4238`, the xip is T3, which is still running. |
+| `TestMVCC_OldSnapshotBlocksVacuum` | 5 updates while an RR transaction is open → after VACUUM **all 6 versions remain**; VACUUM removes them only after the transaction ends. |
+| `TestMVCC_RowLocksLiveInTupleHeader` | After `FOR SHARE`, `t_xmax = locker's xid` (nothing was deleted); two shared lockers → `pgrowlocks` shows `multi = true, xids = {a,b}`. |
 
-### MySQL（`mysql/mvcc_test.go`）
+### MySQL (`mysql/mvcc_test.go`)
 
-| 實驗 | 你會看到 |
+| Experiment | What you see |
 |---|---|
-| `TestMVCC_ReadViewCreatedAtFirstRead` | `START TRANSACTION` 後別人提交的資料，第一次 SELECT **看得到**；`WITH CONSISTENT SNAPSHOT` 則看不到。 |
-| `TestMVCC_SnapshotReadVsCurrentRead` | 同一交易內：`SELECT` → 0、`SELECT … FOR SHARE` → 5、再 `SELECT` → 0。UPDATE 以 current 版本計算。 |
-| `TestMVCC_RR_PhantomAppearsAfterUpdate` | **MySQL RR 的著名幻讀**：快照看不到的列，`UPDATE … WHERE` 卻改到了（1 row），之後 SELECT 就「冒出來」了。PG 的對照組 `TestIso_RR_UpdateUsesSnapshotNoPhantom` 會更新 0 列。 |
-| `TestMVCC_TrxIdAssignedOnFirstWrite` | 唯讀交易的 `trx_id` 是 ≥ 2⁴⁸ 的假 id（`562947782929624`），第一次寫入才拿到真的（`23423`）。 |
-| `TestMVCC_LongReadViewBlocksPurge` | 開著 read view 做 200 次提交 → History list length `42 → 242`；read view 關掉後 purge 清到 `0`。 |
+| `TestMVCC_ReadViewCreatedAtFirstRead` | Data another session commits after `START TRANSACTION` **is visible** to the first SELECT; with `WITH CONSISTENT SNAPSHOT` it is not. |
+| `TestMVCC_SnapshotReadVsCurrentRead` | In one transaction: `SELECT` → 0, `SELECT … FOR SHARE` → 5, `SELECT` again → 0. UPDATE computes from the current version. |
+| `TestMVCC_RR_PhantomAppearsAfterUpdate` | **MySQL RR's famous phantom**: a row invisible to the snapshot is still changed by `UPDATE … WHERE` (1 row), and then "appears" in later SELECTs. The PG counterpart `TestIso_RR_UpdateUsesSnapshotNoPhantom` updates 0 rows. |
+| `TestMVCC_TrxIdAssignedOnFirstWrite` | A read-only transaction's `trx_id` is a fake id ≥ 2⁴⁸ (`562947782929624`); it gets a real one (`23423`) on its first write. |
+| `TestMVCC_LongReadViewBlocksPurge` | 200 commits while a read view is open → history list length `42 → 242`; after the read view closes, purge brings it to `0`. |
 
 ---
 
-## 2. 鎖
+## 2. Locks
 
-### PostgreSQL：四種列鎖（`TestLock_RowLockConflictMatrix`，實測）
+### PostgreSQL: the four row lock modes (`TestLock_RowLockConflictMatrix`, measured)
 
-| 持有 \ 請求 | KEY SHARE | SHARE | NO KEY UPDATE | UPDATE |
+| Held \ Requested | KEY SHARE | SHARE | NO KEY UPDATE | UPDATE |
 |---|---|---|---|---|
 | **FOR KEY SHARE** | ok | ok | ok | BLOCK |
 | **FOR SHARE** | ok | ok | BLOCK | BLOCK |
 | **FOR NO KEY UPDATE** | ok | BLOCK | BLOCK | BLOCK |
 | **FOR UPDATE** | BLOCK | BLOCK | BLOCK | BLOCK |
 
-- 一般 `UPDATE`（沒改 key 欄位）只拿 `FOR NO KEY UPDATE`；FK 檢查只拿 `FOR KEY SHARE`，所以**更新父表的非 key 欄位不會擋住子表 INSERT**（`TestLock_ForeignKeyAndNoKeyUpdate`）。
-- 🔎 **實測發現**：`UPDATE parent SET id = 1 WHERE id = 1`（key 設成同一個值）**仍是 NO KEY UPDATE**。PG 比較新舊 key 值，只有真的改變才升級成 `FOR UPDATE`。
-- PG 的列鎖等待在 `pg_locks` 裡長這樣：等待者對**持有者的 transactionid** 要 `ShareLock`（WAITING），外加一個 `tuple` 鎖排隊。列鎖本身不在 `pg_locks`，而在 tuple header。
-- **DDL lock queue**（`TestLock_DDLLockQueue`）：等待中的 `ACCESS EXCLUSIVE` 會讓後面所有 SELECT 一起排隊，這是 production 最常見的「一個 ALTER 把整站打掛」。解法：`SET lock_timeout = '…'` 後重試。
-- `NOWAIT` / `SKIP LOCKED`（job queue）、unique insert 等待對方結果、advisory lock 各有一個實驗。
+- A plain `UPDATE` that does not change key columns takes only `FOR NO KEY UPDATE`; an FK check takes only `FOR KEY SHARE`, so **updating a non-key column of the parent does not block child INSERTs** (`TestLock_ForeignKeyAndNoKeyUpdate`).
+- 🔎 **Found by measurement**: `UPDATE parent SET id = 1 WHERE id = 1` (key set to the same value) **is still NO KEY UPDATE**. PG compares old and new key values and upgrades to `FOR UPDATE` only if they actually change.
+- In `pg_locks`, a PG row-lock wait looks like this: the waiter requests `ShareLock` on the **holder's transactionid** (WAITING), plus a queued `tuple` lock. The row lock itself is not in `pg_locks`; it lives in the tuple header.
+- **DDL lock queue** (`TestLock_DDLLockQueue`): a waiting `ACCESS EXCLUSIVE` makes every later SELECT queue behind it. This is the most common production "one ALTER took the whole site down". Fix: `SET lock_timeout = '…'` and retry.
+- `NOWAIT` / `SKIP LOCKED` (job queues), waiting on another transaction's unique insert, and advisory locks each have an experiment.
 
-### MySQL InnoDB：record / gap / next-key（`mysql/locks_test.go`，表 `t(id PK, k 非唯一索引)` 值 10/20/30）
+### MySQL InnoDB: record / gap / next-key (`mysql/locks_test.go`, table `t(id PK, k non-unique index)` with values 10/20/30)
 
-`data_locks.LOCK_MODE` 的語彙：
+`data_locks.LOCK_MODE` vocabulary:
 
-| LOCK_MODE | 意義 |
+| LOCK_MODE | Meaning |
 |---|---|
-| `X,REC_NOT_GAP` | record lock：只鎖這筆索引記錄 |
-| `X,GAP` | gap lock：鎖「這筆記錄**之前**」的開區間，不含記錄本身 |
-| `X` | next-key lock = record + 前面的 gap，即 `(prev, rec]` |
-| `X,GAP,INSERT_INTENTION` | 想插入某個 gap、但被別人的 gap lock 擋住 |
-| `supremum pseudo-record` | 頁面上的 +∞，對它上 X = 鎖到無限大 |
+| `X,REC_NOT_GAP` | Record lock: locks only this index record |
+| `X,GAP` | Gap lock: locks the open interval **before** this record, not the record itself |
+| `X` | Next-key lock = record + the gap before it, i.e. `(prev, rec]` |
+| `X,GAP,INSERT_INTENTION` | Wants to insert into a gap but is blocked by someone else's gap lock |
+| `supremum pseudo-record` | The +∞ of a page; X on it = locked up to infinity |
 
-| 實驗 | 語句 | 實測拿到的鎖 | 效果 |
+| Experiment | Statement | Locks measured | Effect |
 |---|---|---|---|
-| `RecordLockOnPK` | `id = 20 FOR UPDATE`（存在） | `X,REC_NOT_GAP 20` | 只鎖該列，旁邊可插入 |
-| `GapLockOnMissingKey` | `id = 15 FOR UPDATE`（不存在） | `X,GAP 20` → 鎖 (10,20) | **另一個交易也能拿同一個 gap lock**；只有 INSERT 會被擋 |
-| `NextKeyRangeOnPK` | `id BETWEEN 15 AND 25 FOR UPDATE` | `X 20` + `X,GAP 30` | 擋 (10,30) 內的插入；30 本身與 >30 不擋（8.0.18+ 修正） |
-| `NonUniqueSecondaryIndex` | `k = 20 FOR UPDATE` | `X (20,20)` + `X,GAP (30,30)` + PK `X,REC_NOT_GAP 20` | k=15、k=25 都被擋：非唯一索引必須鎖兩側 gap 才能防幻讀 |
-| `NoIndexLocksEverything/RR` | `UPDATE … WHERE v = 20`（v 無索引） | 每列 `X` + `supremum` | 等於鎖全表，連 INSERT 都擋 |
-| `NoIndexLocksEverything/RC` | 同上 | 只剩符合的那一列 | RC 會釋放不符合的列（semi-consistent read） |
-| `RC_NoGapLocks` | RC 下 `BETWEEN 10 AND 30 FOR UPDATE` | 只有 record lock | 別人可以插 15 → 第二次查詢出現幻影 |
-| `PlainSelectIsNonLocking` | 別人持有 X 時的普通 SELECT | RR：不等、讀 undo；**SER：變成 `S,REC_NOT_GAP` 並等待** | |
-| `DuplicateKeyCheckWaits` | 插入別人未提交的相同 PK | 新插入的列是**隱式鎖**（data_locks 看不到）；衝突時被轉成顯式 `X,REC_NOT_GAP`，等待者拿 `S` | |
-| `MetadataLockQueue` | 開著的交易 + `ALTER … ALGORITHM=INSTANT` | MDL `SHARED_READ` vs `EXCLUSIVE` | 跟 PG 一樣的 lock queue 問題；`lock_wait_timeout` 是 MDL 的逾時 |
+| `RecordLockOnPK` | `id = 20 FOR UPDATE` (exists) | `X,REC_NOT_GAP 20` | Locks only that row; neighbors can be inserted |
+| `GapLockOnMissingKey` | `id = 15 FOR UPDATE` (missing) | `X,GAP 20` → locks (10,20) | **Another transaction can take the same gap lock**; only INSERT is blocked |
+| `NextKeyRangeOnPK` | `id BETWEEN 15 AND 25 FOR UPDATE` | `X 20` + `X,GAP 30` | Blocks inserts in (10,30); 30 itself and >30 are not blocked (fixed in 8.0.18+) |
+| `NonUniqueSecondaryIndex` | `k = 20 FOR UPDATE` | `X (20,20)` + `X,GAP (30,30)` + PK `X,REC_NOT_GAP 20` | Both k=15 and k=25 blocked: a non-unique index must lock the gaps on both sides to prevent phantoms |
+| `NoIndexLocksEverything/RR` | `UPDATE … WHERE v = 20` (v unindexed) | `X` on every row + `supremum` | Effectively a table lock; even INSERT is blocked |
+| `NoIndexLocksEverything/RC` | Same | Only the matching row remains | RC releases non-matching rows (semi-consistent read) |
+| `RC_NoGapLocks` | `BETWEEN 10 AND 30 FOR UPDATE` under RC | Record locks only | Others can insert 15 → a phantom appears on the second query |
+| `PlainSelectIsNonLocking` | Plain SELECT while another session holds X | RR: no wait, reads undo; **SER: becomes `S,REC_NOT_GAP` and waits** | |
+| `DuplicateKeyCheckWaits` | Inserting the same PK as another uncommitted insert | A freshly inserted row has an **implicit lock** (not in data_locks); on conflict it becomes an explicit `X,REC_NOT_GAP` and the waiter takes `S` | |
+| `MetadataLockQueue` | Open transaction + `ALTER … ALGORITHM=INSTANT` | MDL `SHARED_READ` vs `EXCLUSIVE` | Same lock-queue problem as PG; `lock_wait_timeout` is the MDL timeout |
 
-🔎 **實測發現**：上表的隱式→顯式轉換，`performance_schema.data_locks.THREAD_ID` 會顯示**觸發轉換的那個 thread（T2）**，但 `ENGINE_TRANSACTION_ID` 是 T1 的。看鎖要用 transaction id 對應，框架已處理。
+🔎 **Found by measurement**: for the implicit→explicit conversion above, `performance_schema.data_locks.THREAD_ID` shows **the thread that triggered the conversion (T2)**, while `ENGINE_TRANSACTION_ID` is T1's. Attribute locks by transaction id; the harness does this.
 
 ---
 
-## 3. 死鎖
+## 3. Deadlocks
 
-### PostgreSQL（`postgres/deadlock_test.go`）
+### PostgreSQL (`postgres/deadlock_test.go`)
 
-PG 不會立刻檢查死鎖：等鎖超過 `deadlock_timeout`（預設 1s，實驗設 100ms）才跑偵測，**跑偵測並發現環的那個 process 自己當犧牲者**。錯誤 `40P01`，DETAIL 會列出環：
+PG does not check for deadlocks immediately: detection runs only after a lock wait exceeds `deadlock_timeout` (default 1s, 100ms in these experiments), and **the process that runs detection and finds the cycle becomes the victim itself**. The error is `40P01`, and DETAIL lists the cycle:
 
 ```
 Process 3121 waits for ShareLock on transaction 4370; blocked by process 3119.
@@ -138,43 +139,43 @@ Process 3119 waits for ShareLock on transaction 4371; blocked by process 3120.
 Process 3120 waits for ShareLock on transaction 4372; blocked by process 3121.
 ```
 
-| 案例 | 成因 |
+| Case | Cause |
 |---|---|
-| `OppositeOrder` | 轉帳 A→B 與 B→A 以相反順序鎖列 |
-| `AvoidedByLockOrdering` | 解法：`ORDER BY id FOR UPDATE` 一次依序鎖好 → 只會排隊不會死鎖 |
-| `ShareLockUpgrade` | 兩人都 `FOR SHARE`，再都 UPDATE（S→X 升級） |
-| `UniqueInsertCrossed` | 交叉插入相同 unique key，互等對方交易結果 |
-| `TableLockUpgrade` | 兩人 `LOCK TABLE IN SHARE MODE` 後都 INSERT（需 ROW EXCLUSIVE） |
-| `ThreeWayCycle` | T1→T2→T3→T1 三方環 |
+| `OppositeOrder` | Transfers A→B and B→A lock rows in opposite order |
+| `AvoidedByLockOrdering` | Fix: lock everything up front in order with `ORDER BY id FOR UPDATE` → transactions queue instead of deadlocking |
+| `ShareLockUpgrade` | Both take `FOR SHARE`, then both UPDATE (S→X upgrade) |
+| `UniqueInsertCrossed` | Cross-inserting the same unique keys; each waits for the other's outcome |
+| `TableLockUpgrade` | Both `LOCK TABLE IN SHARE MODE`, then both INSERT (needs ROW EXCLUSIVE) |
+| `ThreeWayCycle` | Three-way cycle T1→T2→T3→T1 |
 
-### MySQL（`mysql/deadlock_test.go`，案例取自 [mysql-deadlocks-case](https://github.com/alleycat1/mysql-deadlocks-case)，原作在 5.7 上重現）
+### MySQL (`mysql/deadlock_test.go`, cases from [mysql-deadlocks-case](https://github.com/alleycat1/mysql-deadlocks-case), originally reproduced on 5.7)
 
-InnoDB 在「等待會形成環」的當下**立即**偵測，回滾 weight 較小（改動/鎖定列較少）的交易，**整個交易**都被 rollback（`1213`）。測試會印出 `SHOW ENGINE INNODB STATUS` 的 LATEST DETECTED DEADLOCK 節錄。
+InnoDB detects a deadlock **immediately**, the moment a wait would close a cycle, and rolls back the transaction with the smaller weight (fewer rows changed/locked). The **whole transaction** is rolled back (`1213`). The tests print the LATEST DETECTED DEADLOCK excerpt from `SHOW ENGINE INNODB STATUS`.
 
-| 案例 | 來源 | 9.7 實測 | 成因 |
+| Case | Source | Measured on 9.7 | Cause |
 |---|---|---|---|
-| `OppositeOrder` | #8 | 💥 死鎖 | 相反順序 |
-| `CheckThenInsert_GapLocks` | #1 | 💥 死鎖 | **最常見**：「先 `SELECT … FOR UPDATE` 確認不存在再 INSERT」，兩人都拿到同一 gap lock（相容），INSERT 的 insert-intention 互相被擋 |
-| `DuplicateInsertThenRollback` | #2 / 官方手冊 | 💥 死鎖 | 三人插入同一 unique key，T1 rollback 後 T2、T3 都持 S 又都要 X |
-| `NonUniqueSecondary_DeleteInsertGap` | #12 | 💥 死鎖 | delete 的 next-key 範圍與自己後續 insert 的 gap 被對方的**等待中**請求覆蓋 |
-| `UniqueSecondary_InsertInsert` | #15 | 💥 死鎖 | 唯一鍵衝突等待的 S next-key 蓋住對方下一筆 insert 的 gap |
-| `Serializable_ReadThenUpdate` | — | 💥 死鎖 | SERIALIZABLE 的 SELECT 隱含 S 鎖 → S→X 升級 |
-| `DeleteThenReinsertSameKey` | #18 | ✅ **不再死鎖** | 5.7 會死鎖。9.7 中 T1 已持有自己 delete-marked 記錄的 X，重新插入的 duplicate check 不會排到 T2 後面 |
-| `UniqueSecondary_DeleteInsert` | #4 | ✅ **不再死鎖** | 同上，重新插入只拿自己記錄周邊的 `S,GAP` |
-| `UpdateUniqueKey_ThreeSessions` | #11 | ✅ **不再死鎖** | 9.7 中 T2/T3 拿的是相容的 `X,GAP` 而不是之後要升級的 S |
+| `OppositeOrder` | #8 | 💥 deadlock | Opposite lock order |
+| `CheckThenInsert_GapLocks` | #1 | 💥 deadlock | **The most common one**: "`SELECT … FOR UPDATE` to check it doesn't exist, then INSERT". Both get the same gap lock (compatible); their insert-intention locks block each other |
+| `DuplicateInsertThenRollback` | #2 / reference manual | 💥 deadlock | Three sessions insert the same unique key; after T1 rolls back, T2 and T3 both hold S and both want X |
+| `NonUniqueSecondary_DeleteInsertGap` | #12 | 💥 deadlock | The delete's next-key range and the gap needed by its own later insert are covered by the other side's **waiting** request |
+| `UniqueSecondary_InsertInsert` | #15 | 💥 deadlock | The S next-key taken while waiting on a unique-key conflict covers the gap of the other side's next insert |
+| `Serializable_ReadThenUpdate` | — | 💥 deadlock | SERIALIZABLE SELECT takes an implicit S lock → S→X upgrade |
+| `DeleteThenReinsertSameKey` | #18 | ✅ **no longer deadlocks** | Deadlocks on 5.7. On 9.7 T1 already holds X on its own delete-marked record, so the re-insert's duplicate check does not queue behind T2 |
+| `UniqueSecondary_DeleteInsert` | #4 | ✅ **no longer deadlocks** | Same as above; the re-insert only takes `S,GAP` around its own record |
+| `UpdateUniqueKey_ThreeSessions` | #11 | ✅ **no longer deadlocks** | On 9.7 T2/T3 take a compatible `X,GAP` instead of an S that later has to be upgraded |
 
-👉 **網路上的 MySQL 死鎖案例多半是 5.7 時代的，不要假設在 8.x/9.x 仍成立，拿這個框架重跑一次最準。**
+👉 **Most MySQL deadlock cases online date from 5.7. Don't assume they still hold on 8.x/9.x; re-running them with this harness is the reliable check.**
 
 ---
 
-## 4. 隔離等級：Hermitage 矩陣（`hermitage/`，實測）
+## 4. Isolation levels: the Hermitage matrix (`hermitage/`, measured)
 
-[Hermitage](https://github.com/ept/hermitage) 的每個異常都在每個 DB × 每個隔離等級自動跑一次。✗ = 異常發生；✓ = 被防止，後面註明**靠什麼防止**（整格含機制都由測試斷言，結果是決定性的）：
+Every [Hermitage](https://github.com/ept/hermitage) anomaly runs automatically on each DB × each isolation level. ✗ = the anomaly occurs; ✓ = prevented, followed by **what prevents it** (every cell, mechanism included, is asserted by the test, and the result is deterministic):
 
-- `mvcc`：快照讓交易根本看不到別人的寫入
-- `lock`：被鎖擋住、被迫排隊（等於序列執行）
-- `abort`：DB 偵測到衝突，回傳 serialization failure（`40001`）
-- `deadlock`：鎖造成死鎖，DB 殺掉一個交易
+- `mvcc`: the snapshot means the transaction never sees the other's writes
+- `lock`: blocked by a lock and forced to queue (effectively serial execution)
+- `abort`: the DB detects the conflict and returns a serialization failure (`40001`)
+- `deadlock`: locks form a deadlock and the DB kills one transaction
 
 | DB | Level | G0 | G1a | G1b | G1c | OTV | PMP | PMP-write | P4 | G-single | G-single-write | G2-item | G2 | RO-anomaly |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -187,49 +188,49 @@ InnoDB 在「等待會形成環」的當下**立即**偵測，回滾 weight 較�
 | mysql | RR | ✓ lock | ✓ mvcc | ✓ mvcc | ✓ mvcc | ✓ lock | ✓ mvcc | ✗ | ✗ | ✓ mvcc | ✗ | ✗ | ✗ | ✗ |
 | mysql | SER | ✓ lock | ✓ lock | ✓ lock | ✓ deadlock | ✓ lock | ✓ lock | ✓ lock | ✓ deadlock | ✓ lock | ✓ deadlock | ✓ deadlock | ✓ deadlock | ✓ deadlock |
 
-\* MySQL RU 的 PMP-write 是**碰巧**正確：T2 髒讀到 T1 未提交的值，結果剛好等於序列 T1→T2。RU 不安全，看 G1a。
+\* MySQL RU's PMP-write is correct **by accident**: T2 dirty-reads T1's uncommitted value, and the result happens to equal the serial order T1→T2. RU is not safe; see G1a.
 
-| 異常 | 白話 |
+| Anomaly | In plain words |
 |---|---|
-| G0 dirty write | 覆寫別人未提交的寫入 |
-| G1a/b/c dirty read | 讀到被 rollback 的值 / 中間值 / 互相讀到對方未提交的值 |
-| OTV | 看到 T2 的寫入後，又看到 T2 已覆蓋的舊值 |
-| PMP phantom | 同一條件查兩次，多出別人新插入的列 |
-| PMP-write | DELETE/UPDATE 的條件判斷混用新舊版本（PG 文件的 `website.hits` 範例） |
-| P4 lost update | 讀-改-寫，其中一個更新消失 |
-| G-single read skew | 讀到某交易提交「前」的 x 和提交「後」的 y |
-| G2-item write skew | 各讀兩筆、各改不同一筆，破壞跨列不變式（值班醫生） |
-| G2 | 同上但是用條件查詢 + INSERT |
-| RO-anomaly | Fekete 2004：連**唯讀**交易都能看到不可能的狀態，只有真正的 serializable 能擋 |
+| G0 dirty write | Overwriting someone else's uncommitted write |
+| G1a/b/c dirty read | Reading a value that was rolled back / an intermediate value / each reading the other's uncommitted value |
+| OTV | After seeing T2's write, seeing an old value T2 already overwrote |
+| PMP phantom | The same predicate queried twice returns an extra row someone else inserted |
+| PMP-write | A DELETE/UPDATE predicate evaluated on a mix of old and new versions (the `website.hits` example from the PG docs) |
+| P4 lost update | Read-modify-write where one of the updates disappears |
+| G-single read skew | Reading x from before a transaction commits and y from after |
+| G2-item write skew | Each reads two rows and updates a different one, breaking a cross-row invariant (on-call doctors) |
+| G2 | Same, but with a predicate query + INSERT |
+| RO-anomaly | Fekete 2004: even a **read-only** transaction can observe an impossible state; only true serializability prevents it |
 
-### 讀矩陣的重點
+### Key takeaways from the matrix
 
-1. **名字一樣，保證不同**。PG 的 RR 是 Snapshot Isolation（擋 P4、G-single），MySQL 的 RR 連 **lost update 都不擋**。Hermitage 作者認為 MySQL RR 更接近 "Monotonic Atomic View"。
-2. **PG 靠「失敗」，MySQL 靠「等待」**。PG RR/SER 幾乎全是 `abort`，應用程式**必須寫重試**；MySQL SER 幾乎全是 `lock`/`deadlock`，吞吐量差但語意直觀。
-3. **PG 的 RU = RC**，PG 不存在 dirty read。
-4. **MySQL RR 的 PMP 是 ✓ mvcc，但 PMP-write 是 ✗**：純讀有快照保護，一旦寫入就變 current read，看到快照外的世界（見 §1 的 phantom 實驗）。
-5. 想在 MySQL 防 write skew / lost update：讀的時候就上鎖（`FOR UPDATE`），見 `mysql/TestIso_RR_WriteSkewAndForUpdateFix`、`TestIso_RR_LostUpdateAndFixes`。
+1. **Same name, different guarantees.** PG's RR is Snapshot Isolation (prevents P4 and G-single); MySQL's RR **does not even prevent lost updates**. The Hermitage author considers MySQL RR closer to "Monotonic Atomic View".
+2. **PG relies on failing, MySQL on waiting.** PG RR/SER are almost all `abort`, so applications **must retry**; MySQL SER is almost all `lock`/`deadlock`: lower throughput, but intuitive semantics.
+3. **PG's RU = RC**; PG has no dirty reads.
+4. **MySQL RR's PMP is ✓ mvcc, but PMP-write is ✗**: pure reads are protected by the snapshot, but a write switches to a current read and sees outside the snapshot (see the phantom experiment in §1).
+5. To prevent write skew / lost updates on MySQL, lock when reading (`FOR UPDATE`); see `mysql/TestIso_RR_WriteSkewAndForUpdateFix` and `TestIso_RR_LostUpdateAndFixes`.
 
-### 其他隔離等級實驗
+### Other isolation experiments
 
-| 測試 | 重點 |
+| Test | Point |
 |---|---|
-| `postgres/TestIso_RC_EvalPlanQualDocsExample` | 官方文件範例：等鎖後只 re-check「自己快照找到的列」，所以 `DELETE WHERE hits = 10` 刪了 0 列，即使此時有一列 hits=10 |
-| `postgres/TestIso_RC_InPlaceIncrementIsSafe` | `SET n = n + 1` 在 RC 是安全的；在 client 端算好再寫回就會 lost update |
-| `postgres/TestIso_RR_FirstUpdaterWinsAndRetry` | RR 更新被別人改過的列 → `40001`，整個交易重試；先更新者若 rollback，等待者正常繼續 |
-| `postgres/TestIso_WriteSkew_OnCallDoctors` | RR 兩位醫生都下班（0 人值班）；SER 第二個 COMMIT 失敗 |
-| `postgres/TestIso_SER_FalsePositiveFromSeqScan` | **SSI 的 false positive**：seq scan 拿 relation 級 SIRead 鎖，兩個交易操作完全不相干的 group 仍會 `40001`；改用 index scan 就沒事 |
-| `mysql/TestIso_SER_AutocommitSelectStaysNonLocking` | MySQL SERIALIZABLE 只把**顯式交易中**的 SELECT 變成鎖定讀；autocommit 的 SELECT 仍是快照讀 |
+| `postgres/TestIso_RC_EvalPlanQualDocsExample` | The docs example: after a lock wait, PG re-checks only "the rows its own snapshot found", so `DELETE WHERE hits = 10` deletes 0 rows even though a row with hits=10 exists at that point |
+| `postgres/TestIso_RC_InPlaceIncrementIsSafe` | `SET n = n + 1` is safe under RC; computing in the client and writing back loses updates |
+| `postgres/TestIso_RR_FirstUpdaterWinsAndRetry` | Under RR, updating a row someone else changed → `40001`, retry the whole transaction; if the first updater rolls back, the waiter continues normally |
+| `postgres/TestIso_WriteSkew_OnCallDoctors` | RR: both doctors go off call (0 on call); SER: the second COMMIT fails |
+| `postgres/TestIso_SER_FalsePositiveFromSeqScan` | **SSI false positive**: a seq scan takes a relation-level SIRead lock, so two transactions working on unrelated groups still get `40001`; an index scan avoids it |
+| `mysql/TestIso_SER_AutocommitSelectStaysNonLocking` | MySQL SERIALIZABLE turns SELECTs into locking reads only **inside explicit transactions**; an autocommit SELECT stays a snapshot read |
 
-### Jepsen 風格隨機壓測（`jepsen/`，實測）
+### Jepsen-style randomized test (`jepsen/`, measured)
 
-Hermitage 是「人工挑好的一種交錯」；[Jepsen](https://github.com/jepsen-io/jepsen) 的做法是**大量並發隨機交易，再對整段歷史檢查不變式**。這裡實作 Jepsen 經典的 **bank test**：
+Hermitage is "one hand-picked interleaving"; [Jepsen](https://github.com/jepsen-io/jepsen) instead runs **many concurrent random transactions and checks invariants over the whole history**. This implements Jepsen's classic **bank test**:
 
-- 8 個 writer 隨機轉帳：讀兩個帳戶餘額 → 在 Go 裡計算 → 寫回（client 端 read-modify-write）
-- 2 個 reader：在**同一個交易裡**把 5 個帳戶逐一 SELECT 加總**兩次**
-- 遇到死鎖 / serialization failure 就整個交易重試（正確的應用程式寫法）
+- 8 writers make random transfers: read two balances → compute in Go → write back (client-side read-modify-write)
+- 2 readers SELECT each of the 5 accounts and sum them **twice in the same transaction**
+- Deadlocks / serialization failures retry the whole transaction (as a correct application must)
 
-| DB | Level | commits | retries | unstable reads（兩次加總不同） | 讀到總額 ≠ 500 | 最終總額 |
+| DB | Level | commits | retries | unstable reads (two sums differ) | reads with total ≠ 500 | final total |
 |---|---|---|---|---|---|---|
 | postgres | RU | 1575 | 21 | 39 / 1511 | 1409 / 1511 | 741 ✗ |
 | postgres | RC | 1609 | 25 | 47 / 1520 | 1519 / 1520 | 804 ✗ |
@@ -240,43 +241,43 @@ Hermitage 是「人工挑好的一種交錯」；[Jepsen](https://github.com/jep
 | mysql | RR | 1964 | 91 | **0** | 918 / 925 | **2739 ✗** |
 | mysql | SER | 615 | 1665 | **0** | **0** | **500** |
 
-（每格跑 1.5 秒，數字每次不同，但 ✗ 的模式很穩定：連續 4 次乾淨重跑，PG RR/SER 與 MySQL SER 每次都是 0 / 0 / 500，MySQL RR 每次都是 unstable 0、最終總額偏離 500。）
+(Each cell runs for 1.5 seconds. The numbers change every run, but the ✗ pattern is stable: across 4 consecutive clean runs, PG RR/SER and MySQL SER were always 0 / 0 / 500, and MySQL RR always had 0 unstable reads with a final total away from 500.)
 
-- **MySQL RR 最值得看**：unstable reads = 0，快照完全一致；但總額從 500 漂到 2739，因為 RR 不擋 lost update（Hermitage P4）。「快照一致」不等於「資料正確」。
-- **PG RR 靠 abort 保住正確性**：457 次重試換來總額不變（first-updater-wins）。
-- **MySQL SER 靠鎖**：正確，但 1665 次死鎖重試，commits 只有其他等級的 1/3。這就是 SERIALIZABLE-by-locking 的代價。
-- 弱等級的異常是機率性的，測試只對「有保證的等級」（PG RR/SER、MySQL SER）做斷言，弱等級只回報。
-
----
-
-## 5. 做實驗時踩到的坑（也是知識點）
-
-1. **`information_schema.innodb_trx` 是快取**：只有「距上次讀取超過 100ms」才會刷新。高頻輪詢會讓它永遠停在舊狀態（框架一開始用它偵測等鎖，結果偵測不到、測試多跑了 2 分鐘）。要用 `performance_schema.data_lock_waits`。
-2. **processlist 的 STATE 比對要區分大小寫**：`waiting for handler commit` 是正常提交，不是等鎖。
-3. **MySQL 死鎖犧牲者的整個交易已被 rollback**，之後的語句會以 autocommit 執行。應用程式（和測試框架）若沒注意，會在「以為還在交易中」的狀態下寫入資料。
-4. **History list length、SSI 的 predicate lock 都是 server 全域的**，跟其他 workload 互相影響。`make test` 用 `-p 1` 讓 package 依序執行。
+- **MySQL RR is the one to look at**: 0 unstable reads, a perfectly consistent snapshot, yet the total drifted from 500 to 2739, because RR does not prevent lost updates (Hermitage P4). A consistent snapshot is not the same as correct data.
+- **PG RR stays correct by aborting**: 457 retries buy an unchanged total (first-updater-wins).
+- **MySQL SER stays correct by locking**, but with 1665 deadlock retries and about 1/3 the commits of the other levels. That is the cost of serializability by locking.
+- Anomalies at weak levels are probabilistic, so the test asserts only the levels that guarantee correctness (PG RR/SER, MySQL SER); weak levels are only reported.
 
 ---
 
-## 6. 目錄
+## 5. Pitfalls hit while building this (also worth knowing)
+
+1. **`information_schema.innodb_trx` is a cache**: it refreshes only if it has not been read for more than 100ms. High-frequency polling keeps it stale forever (the harness first used it for lock-wait detection, missed every wait, and the tests ran 2 minutes longer). Use `performance_schema.data_lock_waits`.
+2. **Match the processlist STATE case-sensitively**: `waiting for handler commit` is a normal commit, not a lock wait.
+3. **A MySQL deadlock victim's whole transaction is already rolled back**, and later statements run in autocommit mode. An application (or test harness) that misses this writes data while believing it is still inside a transaction.
+4. **History list length and SSI predicate locks are server-wide**, so they interfere with other workloads. `make test` uses `-p 1` to run packages one at a time.
+
+---
+
+## 6. Layout
 
 ```
-internal/lab/        多 session 交錯執行框架（Session、Op、等鎖偵測、鎖觀察、錯誤分類）
-hermitage/           Hermitage 異常矩陣（PG + MySQL × 4 levels × 13 anomalies）
-jepsen/              Jepsen 風格 bank test：並發隨機轉帳 + 不變式檢查
+internal/lab/        multi-session interleaving harness (Session, Op, lock-wait detection, lock inspection, error classification)
+hermitage/           Hermitage anomaly matrix (PG + MySQL × 4 levels × 13 anomalies)
+jepsen/              Jepsen-style bank test: concurrent random transfers + invariant checks
 postgres/            mvcc_test / locks_test / deadlock_test / isolation_test
 mysql/               mvcc_test / locks_test / deadlock_test / isolation_test
-docker-compose.yml   postgres:18.6、mysql:9.7.4
+docker-compose.yml   postgres:18.6, mysql:9.7.4
 ```
 
-連線字串可用 `LAB_PG_DSN` / `LAB_MYSQL_DSN` 覆寫（`%s` 是資料庫名）。
+Connection strings can be overridden with `LAB_PG_DSN` / `LAB_MYSQL_DSN` (`%s` is the database name).
 
-## 參考
+## References
 
-- PostgreSQL 18 — [Transaction Isolation](https://www.postgresql.org/docs/18/transaction-iso.html)、[Explicit Locking](https://www.postgresql.org/docs/18/explicit-locking.html)
-- MySQL 8.4 — [InnoDB Transaction Isolation Levels](https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html)、[InnoDB Locking](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html)
-- Martin Kleppmann — [Hermitage: Testing the "I" in ACID](https://martin.kleppmann.com/2014/11/25/hermitage-testing-the-i-in-acid.html)、[ept/hermitage](https://github.com/ept/hermitage)
+- PostgreSQL 18 — [Transaction Isolation](https://www.postgresql.org/docs/18/transaction-iso.html), [Explicit Locking](https://www.postgresql.org/docs/18/explicit-locking.html)
+- MySQL 8.4 — [InnoDB Transaction Isolation Levels](https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html), [InnoDB Locking](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html)
+- Martin Kleppmann — [Hermitage: Testing the "I" in ACID](https://martin.kleppmann.com/2014/11/25/hermitage-testing-the-i-in-acid.html), [ept/hermitage](https://github.com/ept/hermitage)
 - Cockroach Labs — [SQL isolation levels explained](https://www.cockroachlabs.com/blog/sql-isolation-levels-explained/)
-- [jepsen-io/jepsen](https://github.com/jepsen-io/jepsen)、[alleycat1/mysql-deadlocks-case](https://github.com/alleycat1/mysql-deadlocks-case)
+- [jepsen-io/jepsen](https://github.com/jepsen-io/jepsen), [alleycat1/mysql-deadlocks-case](https://github.com/alleycat1/mysql-deadlocks-case)
 - Fekete, O'Neil, O'Neil — *A Read-Only Transaction Anomaly Under Snapshot Isolation* (2004)
 - Ports & Grittner — *Serializable Snapshot Isolation in PostgreSQL* (VLDB 2012)
