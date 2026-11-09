@@ -183,15 +183,16 @@ var scenarios = []scenario{
 		name: "P4", desc: "Lost Update: both read the same value and write back; one update is lost",
 		run: func(e *env) bool {
 			e.begin()
-			e.T1.Do("select * from test where id = 1")
-			e.T2.Do("select * from test where id = 1")
+			r1 := e.T1.Do("select * from test where id = 1")
+			r2 := e.T2.Do("select * from test where id = 1")
 			e.T1.Do("update test set value = 11 where id = 1")
 			e.T2.Do("update test set value = 11 where id = 1")
 			e.T1.Do("commit")
 			e.T2.Do("commit")
 			e.L.WaitAll()
 			// both wrote 11 based on reading 10 and both committed → one increment lost
-			return committed(e.T1, e.L) && committed(e.T2, e.L)
+			return r1.Text() == "(1,10)" && r2.Text() == "(1,10)" &&
+				committed(e.T1, e.L) && committed(e.T2, e.L)
 		},
 	},
 	{
@@ -212,6 +213,20 @@ var scenarios = []scenario{
 		},
 	},
 	{
+		name: "G-single-pred", desc: "Read Skew (predicate): a second predicate read sees a row a concurrent transaction changed",
+		run: func(e *env) bool {
+			e.begin()
+			r1 := e.T1.Do("select * from test where value % 5 = 0")
+			e.T2.Do("update test set value = 12 where value = 10")
+			e.T2.Do("commit")
+			r2 := e.T1.Do("select * from test where value % 3 = 0")
+			e.T1.Do("commit")
+			e.L.WaitAll()
+			// T1 saw id=1 as 10 (before T2), then as 12 (after T2)
+			return strings.Contains(r1.Text(), "(1,10)") && strings.Contains(r2.Text(), "(1,12)")
+		},
+	},
+	{
 		name: "G-single-write", desc: "Read Skew (write): x is read from an old snapshot, but DELETE's predicate acts on the new y",
 		run: func(e *env) bool {
 			e.begin()
@@ -220,40 +235,46 @@ var scenarios = []scenario{
 			e.T2.Do("update test set value = 12 where id = 1")
 			e.T2.Do("update test set value = 18 where id = 2")
 			e.T2.Do("commit")
-			e.T1.Do("delete from test where value = 20")
+			d := e.T1.Do("delete from test where value = 20")
 			e.T1.Do("select * from test")
 			e.T1.Do("commit")
 			e.L.WaitAll()
-			// T1 saw x=10 (before T2) yet acted on y after T2 → dependency cycle
-			return r1.Str() == "10" && committed(e.T1, e.L) && committed(e.T2, e.L)
+			// T1 saw x=10 (before T2) yet DELETE's predicate saw y=18 (after T2) and deleted
+			// nothing → dependency cycle. Deleting id=2 instead is the serial order T1→T2.
+			return r1.Str() == "10" && d.OK() && d.Affected == 0 &&
+				committed(e.T1, e.L) && committed(e.T2, e.L)
 		},
 	},
 	{
 		name: "G2-item", desc: "Item Anti-dependency Cycles (write skew): both read two rows, each updates a different one",
 		run: func(e *env) bool {
 			e.begin()
-			e.T1.Do("select * from test where id in (1,2)")
-			e.T2.Do("select * from test where id in (1,2)")
+			r1 := e.T1.Do("select * from test where id in (1,2)")
+			r2 := e.T2.Do("select * from test where id in (1,2)")
 			e.T1.Do("update test set value = 11 where id = 1")
 			e.T2.Do("update test set value = 21 where id = 2")
 			e.T1.Do("commit")
 			e.T2.Do("commit")
 			e.L.WaitAll()
-			return committed(e.T1, e.L) && committed(e.T2, e.L)
+			// both decided on the original rows, neither saw the other's write
+			return r1.Text() == "(1,10) (2,20)" && r2.Text() == "(1,10) (2,20)" &&
+				committed(e.T1, e.L) && committed(e.T2, e.L)
 		},
 	},
 	{
 		name: "G2", desc: "Predicate Anti-dependency Cycles: both read a predicate, each inserts a row matching the other's",
 		run: func(e *env) bool {
 			e.begin()
-			e.T1.Do("select * from test where value % 3 = 0")
-			e.T2.Do("select * from test where value % 3 = 0")
+			r1 := e.T1.Do("select * from test where value % 3 = 0")
+			r2 := e.T2.Do("select * from test where value % 3 = 0")
 			e.T1.Do("insert into test (id, value) values (3, 30)")
 			e.T2.Do("insert into test (id, value) values (4, 42)")
 			e.T1.Do("commit")
 			e.T2.Do("commit")
 			e.L.WaitAll()
-			return committed(e.T1, e.L) && committed(e.T2, e.L)
+			// both saw an empty predicate, neither saw the other's insert
+			return len(r1.Rows) == 0 && len(r2.Rows) == 0 && r1.OK() && r2.OK() &&
+				committed(e.T1, e.L) && committed(e.T2, e.L)
 		},
 	},
 	{
@@ -296,19 +317,19 @@ const (
 // expected[db][level], in scenarios order.
 var expected = map[lab.Kind]map[lab.Level][]string{
 	lab.Postgres: {
-		//                      G0  G1a G1b G1c OTV PMP PMPw P4 Gs  Gsw G2i G2 RO
-		lab.ReadUncommitted: {lk, mv, mv, mv, lk, A, A, A, A, A, A, A, A},
-		lab.ReadCommitted:   {lk, mv, mv, mv, lk, A, A, A, A, A, A, A, A},
-		lab.RepeatableRead:  {ab, mv, mv, mv, ab, mv, ab, ab, mv, ab, A, A, A},
-		lab.Serializable:    {ab, mv, mv, ab, ab, mv, ab, ab, mv, ab, ab, ab, ab},
+		//                      G0  G1a G1b G1c OTV PMP PMPw P4 Gs  Gsp Gsw G2i G2 RO
+		lab.ReadUncommitted: {lk, mv, mv, mv, lk, A, A, A, A, A, A, A, A, A},
+		lab.ReadCommitted:   {lk, mv, mv, mv, lk, A, A, A, A, A, A, A, A, A},
+		lab.RepeatableRead:  {ab, mv, mv, mv, ab, mv, ab, ab, mv, mv, ab, A, A, A},
+		lab.Serializable:    {ab, mv, mv, ab, ab, mv, ab, ab, mv, mv, ab, ab, ab, ab},
 	},
 	lab.MySQL: {
 		// RU passes PMP-write by luck: T2's SELECT dirty-reads T1's uncommitted (1,20)
 		// and deletes id=1, which happens to equal serial T1→T2. RU is not safe (see G1a).
-		lab.ReadUncommitted: {lk, A, A, A, A, A, lk, A, A, A, A, A, A},
-		lab.ReadCommitted:   {lk, mv, mv, mv, lk, A, A, A, A, A, A, A, A},
-		lab.RepeatableRead:  {lk, mv, mv, mv, lk, mv, A, A, mv, A, A, A, A},
-		lab.Serializable:    {lk, lk, lk, dl, lk, lk, lk, dl, lk, dl, dl, dl, dl},
+		lab.ReadUncommitted: {lk, A, A, A, A, A, lk, A, A, A, A, A, A, A},
+		lab.ReadCommitted:   {lk, mv, mv, mv, lk, A, A, A, A, A, A, A, A, A},
+		lab.RepeatableRead:  {lk, mv, mv, mv, lk, mv, A, A, mv, mv, A, A, A, A},
+		lab.Serializable:    {lk, lk, lk, dl, lk, lk, lk, dl, lk, lk, dl, dl, dl, dl},
 	},
 }
 
@@ -338,6 +359,7 @@ func TestHermitage(t *testing.T) {
 		results[kind] = map[lab.Level][]cell{}
 		t.Run(kind.String(), func(t *testing.T) {
 			for _, level := range lab.AllLevels {
+				results[kind][level] = make([]cell, len(scenarios))
 				t.Run(level.Short(), func(t *testing.T) {
 					for i, sc := range scenarios {
 						t.Run(sc.name, func(t *testing.T) {
@@ -356,7 +378,7 @@ func TestHermitage(t *testing.T) {
 							if anomaly {
 								c = cell{got: A}
 							}
-							results[kind][level] = append(results[kind][level], c)
+							results[kind][level][i] = c
 							L.Note("result: %s %s   final rows: %s", c.got, c.how, e.final())
 							got := strings.TrimSpace(c.got + " " + c.how)
 							if want := expected[kind][level][i]; want != got {
@@ -379,12 +401,18 @@ func TestHermitage(t *testing.T) {
 	for _, kind := range []lab.Kind{lab.Postgres, lab.MySQL} {
 		for _, level := range lab.AllLevels {
 			cells := results[kind][level]
-			if len(cells) == 0 {
-				continue
-			}
+			ran := false
 			strs := make([]string, len(cells))
 			for i, c := range cells {
 				strs[i] = strings.TrimSpace(c.got + " " + c.how)
+				if strs[i] == "" {
+					strs[i] = "–" // filtered out by -run, skipped, or failed before a result
+				} else {
+					ran = true
+				}
+			}
+			if !ran {
+				continue
 			}
 			fmt.Fprintf(&b, "| %s | %s | %s |\n", kind, level.Short(), strings.Join(strs, " | "))
 		}

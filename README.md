@@ -11,7 +11,7 @@ Every conclusion is backed by a test; run it with `-v` to see the full timeline 
 
 ```bash
 make up          # docker-compose starts PG (55432) + MySQL (53306)
-make test        # all experiments (316 tests, about 70 seconds)
+make test        # all experiments (324 tests, about 70 seconds)
 make hermitage   # isolation-level anomaly matrix
 go test -p 1 -count=1 -v ./mysql -run 'TestLock_GapLockOnMissingKey'   # timeline of one experiment
 ```
@@ -39,8 +39,8 @@ Example timeline (`go test ./postgres -v -run DDLLockQueue`):
      │ RD  relation      q          AccessShareLock          WAITING   ← queued behind the DDL!
      └─
   5  TX │ COMMIT
-         DDL │ ↳ #3 done (waited 422ms)
-                 RD │ ↳ #4 done (waited 411ms)   → (1,NULL)
+         DDL │ ↳ #3 done (waited 428ms)
+                 RD │ ↳ #4 done (waited 417ms)   → (1,NULL)
 ```
 
 ---
@@ -65,7 +65,7 @@ Both are MVCC, but they keep old versions in opposite places, and that explains 
 |---|---|
 | `TestMVCC_UpdateCreatesNewTupleVersion` | `pageinspect` shows two versions on the same page: the old one has `t_xmax = updater's xid`, `t_ctid → (0,2)`, `hot = true`. After VACUUM, lp 1 becomes a `redirect` (HOT chain). |
 | `TestMVCC_RollbackLeavesTupleOnDisk` | A rolled-back INSERT **is still on disk**; the first read sets the `xmin_a` (aborted) hint bit. |
-| `TestMVCC_SnapshotTakenAtFirstStatement` | Data committed after `BEGIN` but before the first SELECT **is visible**; in the snapshot `4238:4240:4238`, the xip is T3, which is still running. |
+| `TestMVCC_SnapshotTakenAtFirstStatement` | Data committed after `BEGIN` but before the first SELECT **is visible**; in the snapshot `3086:3088:3086`, the xip is T3, which is still running. |
 | `TestMVCC_OldSnapshotBlocksVacuum` | 5 updates while an RR transaction is open → after VACUUM **all 6 versions remain**; VACUUM removes them only after the transaction ends. |
 | `TestMVCC_RowLocksLiveInTupleHeader` | After `FOR SHARE`, `t_xmax = locker's xid` (nothing was deleted); two shared lockers → `pgrowlocks` shows `multi = true, xids = {a,b}`. |
 
@@ -76,8 +76,8 @@ Both are MVCC, but they keep old versions in opposite places, and that explains 
 | `TestMVCC_ReadViewCreatedAtFirstRead` | Data another session commits after `START TRANSACTION` **is visible** to the first SELECT; with `WITH CONSISTENT SNAPSHOT` it is not. |
 | `TestMVCC_SnapshotReadVsCurrentRead` | In one transaction: `SELECT` → 0, `SELECT … FOR SHARE` → 5, `SELECT` again → 0. UPDATE computes from the current version. |
 | `TestMVCC_RR_PhantomAppearsAfterUpdate` | **MySQL RR's famous phantom**: a row invisible to the snapshot is still changed by `UPDATE … WHERE` (1 row), and then "appears" in later SELECTs. The PG counterpart `TestIso_RR_UpdateUsesSnapshotNoPhantom` updates 0 rows. |
-| `TestMVCC_TrxIdAssignedOnFirstWrite` | A read-only transaction's `trx_id` is a fake id ≥ 2⁴⁸ (`562947782929624`); it gets a real one (`23423`) on its first write. |
-| `TestMVCC_LongReadViewBlocksPurge` | 200 commits while a read view is open → history list length `42 → 242`; after the read view closes, purge brings it to `0`. |
+| `TestMVCC_TrxIdAssignedOnFirstWrite` | A read-only transaction's `trx_id` is a fake id ≥ 2⁴⁸ (`562947600415960`); it gets a real one (`16816`) on its first write. |
+| `TestMVCC_LongReadViewBlocksPurge` | 200 commits while a read view is open → history list length `69 → 200`; after the read view closes, purge brings it to `0`. |
 
 ---
 
@@ -163,9 +163,9 @@ IS / IX come from `FOR SHARE` / `FOR UPDATE` on a row (a different row per sessi
 PG does not check for deadlocks immediately: detection runs only after a lock wait exceeds `deadlock_timeout` (default 1s, 100ms in these experiments), and **the process that runs detection and finds the cycle becomes the victim itself**. The error is `40P01`, and DETAIL lists the cycle:
 
 ```
-Process 3121 waits for ShareLock on transaction 4370; blocked by process 3119.
-Process 3119 waits for ShareLock on transaction 4371; blocked by process 3120.
-Process 3120 waits for ShareLock on transaction 4372; blocked by process 3121.
+Process 799 waits for ShareLock on transaction 2731; blocked by process 797.
+Process 797 waits for ShareLock on transaction 2732; blocked by process 798.
+Process 798 waits for ShareLock on transaction 2733; blocked by process 799.
 ```
 
 | Case | Cause |
@@ -206,16 +206,16 @@ Every [Hermitage](https://github.com/ept/hermitage) anomaly runs automatically o
 - `abort`: the DB detects the conflict and returns a serialization failure (`40001`)
 - `deadlock`: locks form a deadlock and the DB kills one transaction
 
-| DB | Level | G0 | G1a | G1b | G1c | OTV | PMP | PMP-write | P4 | G-single | G-single-write | G2-item | G2 | RO-anomaly |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| postgres | RU | ✓ lock | ✓ mvcc | ✓ mvcc | ✓ mvcc | ✓ lock | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| postgres | RC | ✓ lock | ✓ mvcc | ✓ mvcc | ✓ mvcc | ✓ lock | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| postgres | RR | ✓ abort | ✓ mvcc | ✓ mvcc | ✓ mvcc | ✓ abort | ✓ mvcc | ✓ abort | ✓ abort | ✓ mvcc | ✓ abort | ✗ | ✗ | ✗ |
-| postgres | SER | ✓ abort | ✓ mvcc | ✓ mvcc | ✓ abort | ✓ abort | ✓ mvcc | ✓ abort | ✓ abort | ✓ mvcc | ✓ abort | ✓ abort | ✓ abort | ✓ abort |
-| mysql | RU | ✓ lock | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ lock* | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| mysql | RC | ✓ lock | ✓ mvcc | ✓ mvcc | ✓ mvcc | ✓ lock | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| mysql | RR | ✓ lock | ✓ mvcc | ✓ mvcc | ✓ mvcc | ✓ lock | ✓ mvcc | ✗ | ✗ | ✓ mvcc | ✗ | ✗ | ✗ | ✗ |
-| mysql | SER | ✓ lock | ✓ lock | ✓ lock | ✓ deadlock | ✓ lock | ✓ lock | ✓ lock | ✓ deadlock | ✓ lock | ✓ deadlock | ✓ deadlock | ✓ deadlock | ✓ deadlock |
+| DB | Level | G0 | G1a | G1b | G1c | OTV | PMP | PMP-write | P4 | G-single | G-single-pred | G-single-write | G2-item | G2 | RO-anomaly |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| postgres | RU | ✓ lock | ✓ mvcc | ✓ mvcc | ✓ mvcc | ✓ lock | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| postgres | RC | ✓ lock | ✓ mvcc | ✓ mvcc | ✓ mvcc | ✓ lock | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| postgres | RR | ✓ abort | ✓ mvcc | ✓ mvcc | ✓ mvcc | ✓ abort | ✓ mvcc | ✓ abort | ✓ abort | ✓ mvcc | ✓ mvcc | ✓ abort | ✗ | ✗ | ✗ |
+| postgres | SER | ✓ abort | ✓ mvcc | ✓ mvcc | ✓ abort | ✓ abort | ✓ mvcc | ✓ abort | ✓ abort | ✓ mvcc | ✓ mvcc | ✓ abort | ✓ abort | ✓ abort | ✓ abort |
+| mysql | RU | ✓ lock | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ lock* | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| mysql | RC | ✓ lock | ✓ mvcc | ✓ mvcc | ✓ mvcc | ✓ lock | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| mysql | RR | ✓ lock | ✓ mvcc | ✓ mvcc | ✓ mvcc | ✓ lock | ✓ mvcc | ✗ | ✗ | ✓ mvcc | ✓ mvcc | ✗ | ✗ | ✗ | ✗ |
+| mysql | SER | ✓ lock | ✓ lock | ✓ lock | ✓ deadlock | ✓ lock | ✓ lock | ✓ lock | ✓ deadlock | ✓ lock | ✓ lock | ✓ deadlock | ✓ deadlock | ✓ deadlock | ✓ deadlock |
 
 \* MySQL RU's PMP-write is correct **by accident**: T2 dirty-reads T1's uncommitted value, and the result happens to equal the serial order T1→T2. RU is not safe; see G1a.
 
@@ -228,6 +228,8 @@ Every [Hermitage](https://github.com/ept/hermitage) anomaly runs automatically o
 | PMP-write | A DELETE/UPDATE predicate evaluated on a mix of old and new versions (the `website.hits` example from the PG docs) |
 | P4 lost update | Read-modify-write where one of the updates disappears |
 | G-single read skew | Reading x from before a transaction commits and y from after |
+| G-single-pred | Same, but via two predicate reads: the second one sees a row the other transaction changed |
+| G-single-write | Same, but the second read is a DELETE predicate that acts on the new y |
 | G2-item write skew | Each reads two rows and updates a different one, breaking a cross-row invariant (on-call doctors) |
 | G2 | Same, but with a predicate query + INSERT |
 | RO-anomaly | Fekete 2004: even a **read-only** transaction can observe an impossible state; only true serializability prevents it |
@@ -261,20 +263,20 @@ Hermitage is "one hand-picked interleaving"; [Jepsen](https://github.com/jepsen-
 
 | DB | Level | commits | retries | unstable reads (two sums differ) | reads with total ≠ 500 | final total |
 |---|---|---|---|---|---|---|
-| postgres | RU | 1550 | 20 | 40 / 1477 | 1475 / 1477 | 679 ✗ |
-| postgres | RC | 1565 | 26 | 40 / 1500 | 1499 / 1500 | 711 ✗ |
-| postgres | RR | 1539 | 313 | **0** | **0** | **500** |
-| postgres | SER | 1448 | 360 | **0** | **0** | **500** |
-| mysql | RU | 2499 | 88 | 576 / 811 | 811 / 811 | 4 ✗ |
-| mysql | RC | 1930 | 77 | 813 / 929 | 926 / 929 | 4425 ✗ |
-| mysql | RR | 1661 | 84 | **0** | 797 / 804 | **88637 ✗** |
-| mysql | SER | 607 | 1780 | **0** | **0** | **500** |
+| postgres | RU | 1557 | 23 | 52 / 1470 | 1470 / 1470 | 121 ✗ |
+| postgres | RC | 1545 | 24 | 34 / 1484 | 1377 / 1484 | 775 ✗ |
+| postgres | RR | 1531 | 298 | **0** | **0** | **500** |
+| postgres | SER | 1500 | 528 | **0** | **0** | **500** |
+| mysql | RU | 2495 | 94 | 652 / 843 | 843 / 843 | 5 ✗ |
+| mysql | RC | 1957 | 113 | 831 / 946 | 941 / 946 | 4807 ✗ |
+| mysql | RR | 2038 | 97 | **0** | 980 / 986 | **187044 ✗** |
+| mysql | SER | 661 | 1783 | **0** | **0** | **500** |
 
-(Each cell runs for 1.5 seconds. The numbers change every run, but the ✗ pattern is stable: across 6 clean runs, PG RR/SER and MySQL SER were always 0 / 0 / 500, and MySQL RR always had 0 unstable reads with a final total away from 500.)
+(Each cell runs for 1.5 seconds. The numbers change every run, but the ✗ pattern is stable: across 7 clean runs, PG RR/SER and MySQL SER were always 0 / 0 / 500, and MySQL RR always had 0 unstable reads with a final total away from 500.)
 
-- **MySQL RR is the one to look at**: 0 unstable reads, a perfectly consistent snapshot, yet the total drifted from 500 to 88637, because RR does not prevent lost updates (Hermitage P4). A consistent snapshot is not the same as correct data.
-- **PG RR stays correct by aborting**: 313 retries buy an unchanged total (first-updater-wins).
-- **MySQL SER stays correct by locking**, but with 1780 deadlock retries and about 1/3 the commits of the other levels. That is the cost of serializability by locking.
+- **MySQL RR is the one to look at**: 0 unstable reads, a perfectly consistent snapshot, yet the total drifted from 500 to 187044, because RR does not prevent lost updates (Hermitage P4). A consistent snapshot is not the same as correct data.
+- **PG RR stays correct by aborting**: 298 retries buy an unchanged total (first-updater-wins).
+- **MySQL SER stays correct by locking**, but with 1783 deadlock retries and about 1/3 the commits of the other levels. That is the cost of serializability by locking.
 - Anomalies at weak levels are probabilistic, so the test asserts only the levels that guarantee correctness (PG RR/SER, MySQL SER); weak levels are only reported.
 
 ---
