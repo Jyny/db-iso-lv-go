@@ -122,24 +122,26 @@ var scenarios = []scenario{
 			e.T1.Do("update test set value = 19 where id = 2")
 			e.T2.Do("update test set value = 12 where id = 1")
 			e.T1.Do("commit")
-			r1 := e.T3.Do("select value from test where id = 1")
-			r2 := e.T3.Do("select value from test where id = 2")
+			// T3 reads at the three points Hermitage reads at: after T1 commits, after
+			// T2's (still uncommitted) second write, and after T2 commits.
+			r1 := e.T3.Do("select * from test order by id")
 			e.T2.Do("update test set value = 18 where id = 2")
+			r2 := e.T3.Do("select * from test order by id")
 			e.T2.Do("commit")
-			r3 := e.T3.Do("select value from test where id = 2")
-			r4 := e.T3.Do("select value from test where id = 1")
+			r3 := e.T3.Do("select * from test order by id")
 			e.T3.Do("commit")
 			e.L.WaitAll()
 			sawT2 := false
-			for _, r := range []*lab.Op{r1, r2, r3, r4} {
-				switch r.Str() {
-				case "12", "18":
-					sawT2 = true
-				case "11", "19":
-					if sawT2 {
-						return true
-					}
+			for _, r := range []*lab.Op{r1, r2, r3} {
+				t := r.Text()
+				t1 := strings.Contains(t, "(1,11)") || strings.Contains(t, "(2,19)")
+				t2 := strings.Contains(t, "(1,12)") || strings.Contains(t, "(2,18)")
+				// one read mixing both transactions' writes, or T1's values
+				// reappearing after T2's were seen = anomaly
+				if t1 && (t2 || sawT2) {
+					return true
 				}
+				sawT2 = sawT2 || t2
 			}
 			return false
 		},
@@ -278,23 +280,25 @@ var scenarios = []scenario{
 		},
 	},
 	{
-		name: "RO-anomaly", rows: "(1,0),(2,0)",
-		desc: "Read-only Transaction Anomaly (Fekete 2004): a read-only transaction sees an impossible state",
+		name: "RO-anomaly",
+		desc: "Read-only Transaction Anomaly (Hermitage's G2 with two anti-dependency edges, Fekete et al.): a read-only transaction sees an impossible state",
 		run: func(e *env) bool {
-			// x = checking (id1), y = savings (id2). T2 withdraws 10 from x and charges
-			// a penalty of 1 if x+y-10 < 0. T1 deposits 20 into y. T3 is a read-only report.
-			e.begin()
-			e.T2.Do("select * from test where id in (1,2)") // sees 0,0 → decides to charge the penalty
-			e.T1.Do("update test set value = value + 20 where id = 2")
-			e.T1.Do("commit")
-			r3 := e.T3.Do("select * from test order by id") // report: x=0, y=20
-			e.T3.Do("commit")
-			e.T2.Do("update test set value = -11 where id = 1") // withdraw 10 + penalty 1
+			// Transactions start where Hermitage starts them: T2 after T1's read, T3 after T2 commits.
+			e.T1.Begin(e.level)
+			r1 := e.T1.Do("select * from test order by id") // 10, 20
+			e.T2.Begin(e.level)
+			e.T2.Do("update test set value = value + 5 where id = 2")
 			e.T2.Do("commit")
+			e.T3.Begin(e.level)
+			r3 := e.T3.Do("select * from test order by id") // read-only: 10, 25
+			e.T3.Do("commit")
+			e.T1.Do("update test set value = 0 where id = 1")
+			e.T1.Do("commit")
 			e.L.WaitAll()
-			// the report saw the deposit, yet T2 still charged the penalty → no serial order explains both
+			// T1 read y before T2's write (T1→T2), T3 saw T2's write (T2→T3) but not
+			// T1's (T3→T1) → no serial order explains all three
 			return committed(e.T1, e.L) && committed(e.T2, e.L) && committed(e.T3, e.L) &&
-				r3.Text() == "(1,0) (2,20)"
+				r1.Text() == "(1,10) (2,20)" && r3.Text() == "(1,10) (2,25)"
 		},
 	},
 }

@@ -296,7 +296,7 @@ Hermitage is "one hand-picked interleaving"; [Jepsen](https://github.com/jepsen-
 
 ```
 internal/lab/        multi-session interleaving harness (Session, Op, lock-wait detection, lock inspection, error classification)
-hermitage/           Hermitage anomaly matrix (PG + MySQL × 4 levels × 13 anomalies)
+hermitage/           Hermitage anomaly matrix (PG + MySQL × 4 levels × 14 anomalies)
 jepsen/              Jepsen-style bank test: concurrent random transfers + invariant checks
 postgres/            mvcc_test / locks_test / deadlock_test / isolation_test / manual_test (PG 18 Chapter 13, §7)
 mysql/               mvcc_test / locks_test / deadlock_test / isolation_test / manual_test (MySQL manual 17.7, §7)
