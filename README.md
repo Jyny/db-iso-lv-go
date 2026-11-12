@@ -11,7 +11,7 @@ Every conclusion is backed by a test; run it with `-v` to see the full timeline 
 
 ```bash
 make up          # docker-compose starts PG (55432) + MySQL (53306)
-make test        # all experiments (384 tests, about 75 seconds)
+make test        # all experiments (439 tests, about 80 seconds)
 make hermitage   # isolation-level anomaly matrix
 go test -p 1 -count=1 -v ./mysql -run 'TestLock_GapLockOnMissingKey'   # timeline of one experiment
 ```
@@ -234,6 +234,14 @@ Every [Hermitage](https://github.com/ept/hermitage) anomaly runs automatically o
 | G2 | Same, but with a predicate query + INSERT |
 | RO-anomaly | Fekete 2004: even a **read-only** transaction can observe an impossible state; only true serializability prevents it |
 
+### The Hermitage documents, replayed (`TestHermitageDocs`)
+
+The matrix runs one script per anomaly on every level. Hermitage's own documents use a different statement order at some levels (where a lock would otherwise get in the way), and say what every statement shows. `TestHermitageDocs` replays all 20 code blocks of [postgres.md](https://github.com/ept/hermitage/blob/master/postgres.md) and all 26 of [mysql.md](https://github.com/ept/hermitage/blob/master/mysql.md) verbatim, with the documents' own `begin` / `set transaction` preamble, and asserts each comment: the rows shown, `BLOCKS`, the error printed.
+
+PostgreSQL 18.6 does exactly what the document recorded on 9.3.5. MySQL 9.7.4 differs from the 5.6.21 document in one block:
+
+- **PMP for write predicates, SERIALIZABLE**: the document's `update` (T1) dies with a deadlock when T2 runs its `delete`. On 9.7 there is no deadlock: T1 keeps waiting, T2 deletes and commits, and T1 then updates the remaining row. The anomaly is still prevented (serial order T2 → T1).
+
 ### Key takeaways from the matrix
 
 1. **Same name, different guarantees.** PG's RR is Snapshot Isolation (prevents P4 and G-single); MySQL's RR **does not even prevent lost updates**. The Hermitage author considers MySQL RR closer to "Monotonic Atomic View".
@@ -296,7 +304,7 @@ Hermitage is "one hand-picked interleaving"; [Jepsen](https://github.com/jepsen-
 
 ```
 internal/lab/        multi-session interleaving harness (Session, Op, lock-wait detection, lock inspection, error classification)
-hermitage/           Hermitage anomaly matrix (PG + MySQL × 4 levels × 14 anomalies)
+hermitage/           Hermitage anomaly matrix (PG + MySQL × 4 levels × 14 anomalies) + statement-by-statement replay of Hermitage's postgres.md / mysql.md
 jepsen/              Jepsen-style bank test: concurrent random transfers + invariant checks
 postgres/            mvcc_test / locks_test / deadlock_test / isolation_test / manual_test (PG 18 Chapter 13, §7)
 mysql/               mvcc_test / locks_test / deadlock_test / isolation_test / manual_test (MySQL manual 17.7, §7)
@@ -320,7 +328,7 @@ Every section of [PostgreSQL 18 Chapter 13, Concurrency Control](https://www.pos
 | 13.2.2 Repeatable Read | `TestMVCC_SnapshotTakenAtFirstStatement`, `TestIso_RR_SeesOwnChanges`, `TestIso_RR_ConcurrentChangeOutcomes` (update / delete / rollback / lock-only / FOR UPDATE / FOR SHARE / DELETE / MERGE / read-only never conflicts), `TestIso_RR_FirstUpdaterWinsAndRetry`, `hermitage` RO-anomaly |
 | 13.2.3 Serializable | `TestIso_SER_MytabDocsExample`, `TestIso_SER_ReadOnlyDeferrable`, `TestIso_SER_CheckBeforeInsertTurnsUniqueViolationInto40001`, `TestIso_SER_FalsePositiveFromSeqScan` (seq scan → relation lock), `TestIso_SER_PredicateLockPromotion` (tuple → page → relation), `TestIso_SER_PredicateLockLifetime` (READ ONLY takes none; kept past COMMIT), `TestTx_IdleInTransactionSessionTimeout`, `TestIso_WriteSkew_OnCallDoctors` |
 | 13.3.1 Table-Level Locks | `TestLock_TableLockConflictMatrix`, `TestLock_TableLockAcquiredByCommands` (29 commands), `TestLock_TableLockRequestedByNonTransactionalCommands` (VACUUM, VACUUM FULL, CREATE INDEX / REINDEX CONCURRENTLY), `TestLock_TableLockOwnTxnAndSavepoint`, `TestLock_TableLockReleasedByExceptionBlock`, `TestLock_DDLLockQueue` |
-| 13.3.2 Row-Level Locks | `TestLock_RowLockConflictMatrix`, `TestLock_RowLocksTakenByStatements` (partial and expression unique indexes do not count as keys), `TestIso_RC_LockingReadReturnsUpdatedRow`, `TestLock_RowLockSavepoints`, `TestLock_RowLocksNotInLockTable`, `TestLock_ForeignKeyAndNoKeyUpdate`, `TestMVCC_RowLocksLiveInTupleHeader` |
+| 13.3.2 Row-Level Locks | `TestLock_RowLockConflictMatrix`, `TestLock_RowLocksTakenByStatements` (partial and expression unique indexes do not count as keys), `TestIso_RC_LockingReadReturnsUpdatedRow`, `TestLock_RowLockSavepoints`, `TestLock_RowLocksNotInLockTable`, `TestLock_ForeignKeyAndNoKeyUpdate`, `TestLock_SharedRowLocksBlockWriters` (FOR KEY SHARE / FOR SHARE vs UPDATE, key UPDATE, DELETE), `TestMVCC_RowLocksLiveInTupleHeader` |
 | 13.3.3 Page-Level Locks | not observable from SQL (buffer content locks, released right after each row access) |
 | 13.3.4 Deadlocks | `TestDeadlock_OppositeOrder` (the accounts example), `TestDeadlock_TableLocksOppositeOrder`, `TestDeadlock_AvoidedByLockOrdering`, `TestDeadlock_AvoidedByStrongestLockFirst`, the other `postgres/deadlock_test.go` cases |
 | 13.3.5 Advisory Locks | `TestLock_AdvisorySemantics` (rollback, failed txn, stacking, xact vs session, reentrancy), `TestLock_AdvisoryReleasedAtSessionEnd`, `TestLock_AdvisoryLockFilterPitfall`, `TestLock_Advisory` |

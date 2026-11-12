@@ -1059,3 +1059,35 @@ func TestLock_AdvisoryReleasedAtSessionEnd(t *testing.T) {
 	t2.Do("SELECT pg_try_advisory_lock(9)").MustRows("(true)")
 	t2.Do("SELECT pg_advisory_unlock(9)")
 }
+
+// 13.3.2: what each shared row lock stops other transactions' writes from doing.
+// FOR KEY SHARE blocks DELETE and an UPDATE that changes the key, but not other UPDATEs;
+// FOR SHARE blocks every UPDATE and DELETE.
+func TestLock_SharedRowLocksBlockWriters(t *testing.T) {
+	for _, c := range []struct {
+		mode, write string
+		blocks      bool
+	}{
+		{"FOR KEY SHARE", "UPDATE r SET v = 1 WHERE id = 1", false},
+		{"FOR KEY SHARE", "UPDATE r SET id = 100 WHERE id = 1", true},
+		{"FOR KEY SHARE", "DELETE FROM r WHERE id = 1", true},
+		{"FOR SHARE", "UPDATE r SET v = 1 WHERE id = 1", true},
+		{"FOR SHARE", "DELETE FROM r WHERE id = 1", true},
+	} {
+		t.Run(strings.ReplaceAll(c.mode+"/"+strings.Join(strings.Fields(c.write)[:4], " "), " ", "-"), func(t *testing.T) {
+			L := newLab(t)
+			setupRows(L)
+			t1, t2 := L.Session("T1"), L.Session("T2")
+			t1.Do("BEGIN")
+			t1.Do("SELECT * FROM r WHERE id = 1 " + c.mode)
+			op := t2.Do(c.write)
+			if c.blocks {
+				op.MustBlock()
+			} else {
+				op.MustNotBlock()
+			}
+			t1.Do("COMMIT")
+			op.MustAffect(1)
+		})
+	}
+}
