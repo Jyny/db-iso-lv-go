@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jyny/db-iso-lv-go/internal/lab"
 )
@@ -150,6 +151,13 @@ func TestIso_RR_ConcurrentChangeOutcomes(t *testing.T) {
 			"UPDATE r SET v = v + 1 WHERE id = 1", "could not serialize access due to concurrent update"},
 		{"select-for-update", []string{"UPDATE r SET v = 1 WHERE id = 1"}, "COMMIT",
 			"SELECT * FROM r WHERE id = 1 FOR UPDATE", "could not serialize access due to concurrent update"},
+		{"select-for-share", []string{"UPDATE r SET v = 1 WHERE id = 1"}, "COMMIT",
+			"SELECT * FROM r WHERE id = 1 FOR SHARE", "could not serialize access due to concurrent update"},
+		{"delete", []string{"UPDATE r SET v = 1 WHERE id = 1"}, "COMMIT",
+			"DELETE FROM r WHERE id = 1", "could not serialize access due to concurrent update"},
+		{"merge", []string{"UPDATE r SET v = 1 WHERE id = 1"}, "COMMIT",
+			"MERGE INTO r USING (VALUES (1)) s(id) ON r.id = s.id WHEN MATCHED THEN UPDATE SET v = r.v + 1",
+			"could not serialize access due to concurrent update"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -353,7 +361,11 @@ func TestLock_TableLockAcquiredByCommands(t *testing.T) {
 	cases := []struct{ sql, rel, want string }{
 		{"SELECT * FROM tl", "tl", "AccessShareLock"},
 		{"SELECT * FROM tl FOR UPDATE", "tl", "RowShareLock"},
+		{"SELECT * FROM tl FOR NO KEY UPDATE", "tl", "RowShareLock"},
+		{"SELECT * FROM tl FOR SHARE", "tl", "RowShareLock"},
 		{"SELECT * FROM tl FOR KEY SHARE", "tl", "RowShareLock"},
+		{"SELECT * FROM tl, tl2 FOR UPDATE OF tl", "tl2", "AccessShareLock"},
+		{"UPDATE tl SET v = (SELECT count(*) FROM tl2)", "tl2", "AccessShareLock"},
 		{"INSERT INTO tl VALUES (2, 0)", "tl", "RowExclusiveLock"},
 		{"UPDATE tl SET v = 1", "tl", "RowExclusiveLock"},
 		{"DELETE FROM tl", "tl", "RowExclusiveLock"},
@@ -367,6 +379,8 @@ func TestLock_TableLockAcquiredByCommands(t *testing.T) {
 		{"ALTER TABLE tl2 ADD FOREIGN KEY (tl_id) REFERENCES tl (id)", "tl", "ShareRowExclusiveLock"},
 		{"REFRESH MATERIALIZED VIEW CONCURRENTLY tl_mv", "tl_mv", "ExclusiveLock"},
 		{"REFRESH MATERIALIZED VIEW tl_mv", "tl_mv", "AccessExclusiveLock"},
+		{"ALTER INDEX tl_pkey RENAME TO tl_pk2", "tl_pkey", "ShareUpdateExclusiveLock"},
+		{"ALTER INDEX tl_pkey SET TABLESPACE pg_default", "tl_pkey", "AccessExclusiveLock"},
 		{"REINDEX INDEX tl_pkey", "tl_pkey", "AccessExclusiveLock"},
 		{"REINDEX TABLE tl", "tl", "ShareLock"},
 		{"CLUSTER tl USING tl_pkey", "tl", "AccessExclusiveLock"},
@@ -418,7 +432,8 @@ func TestLock_TableLockOwnTxnAndSavepoint(t *testing.T) {
 
 // 13.3.2: which row lock each statement takes, seen through pgrowlocks, and what it blocks.
 //   - DELETE, and UPDATE of a column with a unique index usable by a foreign key → FOR UPDATE
-//   - any other UPDATE (including of a column with only a PARTIAL unique index) → FOR NO KEY UPDATE
+//   - any other UPDATE (including of a column with only a PARTIAL or EXPRESSION unique
+//     index) → FOR NO KEY UPDATE
 //
 // Row locks never block plain reads.
 func TestLock_RowLocksTakenByStatements(t *testing.T) {
@@ -429,6 +444,7 @@ func TestLock_RowLocksTakenByStatements(t *testing.T) {
 	}{
 		{"UPDATE rl SET v = 1 WHERE id = 1", "No Key Update", false, true},
 		{"UPDATE rl SET p = 7 WHERE id = 1", "No Key Update", false, true},
+		{"UPDATE rl SET e = 7 WHERE id = 1", "No Key Update", false, true},
 		{"UPDATE rl SET u = 7 WHERE id = 1", "Update", true, true},
 		{"DELETE FROM rl WHERE id = 1", "Update", true, true},
 	}
@@ -436,9 +452,10 @@ func TestLock_RowLocksTakenByStatements(t *testing.T) {
 		t.Run(strings.Fields(c.stmt)[0]+"-"+strings.Fields(c.stmt)[3], func(t *testing.T) {
 			L := newLab(t)
 			L.Exec("DROP TABLE IF EXISTS rl",
-				"CREATE TABLE rl (id int primary key, u int unique, p int, v int)",
+				"CREATE TABLE rl (id int primary key, u int unique, p int, v int, e int)",
 				"CREATE UNIQUE INDEX rl_p ON rl (p) WHERE p > 0",
-				"INSERT INTO rl VALUES (1, 1, 1, 0)")
+				"CREATE UNIQUE INDEX rl_e ON rl ((e + 0))",
+				"INSERT INTO rl VALUES (1, 1, 1, 0, 1)")
 			t1, t2 := L.Session("T1"), L.Session("T2")
 			t1.Do("BEGIN")
 			t1.Do(c.stmt)
@@ -771,4 +788,274 @@ END $$`,
 	L.Note("an autocommit statement is a transaction too, and uses the default")
 	s.Do("INSERT INTO guarded VALUES (2)").MustOK()
 	s.Do("SELECT count(*) FROM guarded").MustRows("(2)")
+}
+
+// 13.2.1: a READ COMMITTED query sees the database as of the instant it began. A change
+// committed while the query is still running stays invisible to it. (The query is held up
+// in the middle by an advisory lock; its subquery reads r only after the lock is granted.)
+func TestIso_RC_QueryKeepsItsSnapshotWhileRunning(t *testing.T) {
+	L := newLab(t)
+	setupRows(L)
+	rd, w := L.Session("RD"), L.Session("W")
+	w.Do("SELECT pg_advisory_lock(7)")
+	sel := rd.Do("SELECT pg_advisory_xact_lock(7) IS NULL, (SELECT v FROM r WHERE id = 1)").MustBlock()
+	w.Do("UPDATE r SET v = 1 WHERE id = 1").MustOK()
+	w.Do("SELECT pg_advisory_unlock(7)")
+	sel.MustRows("(false,0)")
+	rd.Do("SELECT v FROM r WHERE id = 1").MustRows("(1)")
+}
+
+// 13.2.1 / 13.3.2: SELECT FOR UPDATE / FOR SHARE that waited for a concurrent writer locks
+// and returns the UPDATED version of the row if it still matches, and no row if it was
+// deleted or no longer matches.
+func TestIso_RC_LockingReadReturnsUpdatedRow(t *testing.T) {
+	for _, mode := range []string{"FOR UPDATE", "FOR SHARE"} {
+		for _, c := range []struct{ name, first, want string }{
+			{"updated", "UPDATE r SET v = 5 WHERE id = 1", "(5)"},
+			{"no-longer-matches", "UPDATE r SET v = 50 WHERE id = 1", "(no rows)"},
+			{"deleted", "DELETE FROM r WHERE id = 1", "(no rows)"},
+		} {
+			t.Run(strings.ReplaceAll(mode, " ", "-")+"/"+c.name, func(t *testing.T) {
+				L := newLab(t)
+				setupRows(L)
+				t1, t2 := L.Session("T1"), L.Session("T2")
+				t1.Do("BEGIN")
+				t1.Do(c.first)
+				t2.Do("BEGIN")
+				sel := t2.Do("SELECT v FROM r WHERE id = 1 AND v < 10 " + mode).MustBlock()
+				t1.Do("COMMIT")
+				sel.MustRows(c.want)
+				t2.Do("COMMIT")
+			})
+		}
+	}
+}
+
+// 13.2.1: the ON CONFLICT guarantees hold "only in Read Committed mode". In REPEATABLE READ
+// a conflict with a row the snapshot cannot see is a serialization failure, for DO UPDATE
+// and DO NOTHING alike.
+func TestIso_RR_InsertOnConflictFails(t *testing.T) {
+	for _, action := range []string{"DO UPDATE SET v = excluded.v", "DO NOTHING"} {
+		t.Run(strings.ReplaceAll(action[:strings.Index(action+" SET", " SET")], " ", "-"), func(t *testing.T) {
+			L := newLab(t)
+			L.Exec("DROP TABLE IF EXISTS kv", "CREATE TABLE kv (k int primary key, v text)")
+			t1, t2 := L.Session("T1"), L.Session("T2")
+			t2.Do("BEGIN ISOLATION LEVEL REPEATABLE READ")
+			t2.Do("SELECT count(*) FROM kv").MustRows("(0)")
+			t1.Do("INSERT INTO kv VALUES (1, 't1')")
+			t2.Do("INSERT INTO kv VALUES (1, 't2') ON CONFLICT (k) " + action).MustFail(lab.IsSerialization)
+			t2.Do("ROLLBACK")
+		})
+	}
+}
+
+// 13.2.1: what MERGE does in READ COMMITTED when the row it matched changes while it waits.
+//   - still joins: the WHEN MATCHED conditions are re-evaluated from the FIRST action, so a
+//     different action than the one originally chosen can run;
+//   - no longer joins (key changed): the NOT MATCHED BY SOURCE and NOT MATCHED actions run;
+//   - deleted: the NOT MATCHED action runs.
+func TestIso_RC_MergeConcurrentChange(t *testing.T) {
+	for _, c := range []struct{ name, first, merge, final string }{
+		{"still-joins-reevaluates-from-first-action", "UPDATE m SET v = 10 WHERE k = 1",
+			`MERGE INTO m USING (VALUES (1)) s(k) ON m.k = s.k
+WHEN MATCHED AND m.v >= 10 THEN DELETE
+WHEN MATCHED THEN UPDATE SET v = m.v + 1`, "(no rows)"},
+		{"join-fails-runs-not-matched-actions", "UPDATE m SET k = 2 WHERE k = 1",
+			`MERGE INTO m USING (VALUES (1)) s(k) ON m.k = s.k
+WHEN MATCHED THEN UPDATE SET v = 99
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = 77
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, -1)`, "(1,-1) (2,77)"},
+		{"deleted-runs-not-matched-action", "DELETE FROM m WHERE k = 1",
+			`MERGE INTO m USING (VALUES (1)) s(k) ON m.k = s.k
+WHEN MATCHED THEN UPDATE SET v = 99
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, -1)`, "(1,-1)"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			L := newLab(t)
+			L.Exec("DROP TABLE IF EXISTS m", "CREATE TABLE m (k int primary key, v int)", "INSERT INTO m VALUES (1, 0)")
+			t1, t2 := L.Session("T1"), L.Session("T2")
+			t1.Do("BEGIN")
+			t1.Do(c.first)
+			merge := t2.Do(c.merge).MustBlock()
+			t1.Do("COMMIT")
+			merge.MustOK()
+			t2.Do("SELECT k, v FROM m ORDER BY k").MustRows(c.final)
+		})
+	}
+}
+
+// 13.2.2: a REPEATABLE READ query sees the transaction's own uncommitted changes on top of
+// its snapshot.
+func TestIso_RR_SeesOwnChanges(t *testing.T) {
+	L := newLab(t)
+	setupRows(L)
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1.Do("BEGIN ISOLATION LEVEL REPEATABLE READ")
+	t1.Do("UPDATE r SET v = 1 WHERE id = 1")
+	t2.Do("UPDATE r SET v = 2 WHERE id = 2")
+	t1.Do("SELECT v FROM r ORDER BY id").MustRows("(1) (0)")
+	t1.Do("COMMIT")
+}
+
+// 13.2.3: SIRead predicate locks cover what was actually read, and fine-grained locks are
+// combined into coarser ones: more than max_pred_locks_per_page tuple locks on one page
+// become a page lock, and more than max_pred_locks_per_relation page or tuple locks on one
+// relation become a relation lock.
+func TestIso_SER_PredicateLockPromotion(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS pl", "CREATE TABLE pl (id int primary key, pad text)",
+		"INSERT INTO pl SELECT g, repeat('x', 500) FROM generate_series(1, 2000) g", "ANALYZE pl")
+	L.Show("SELECT current_setting('max_pred_locks_per_page') AS per_page, current_setting('max_pred_locks_per_relation') AS per_relation, current_setting('max_pred_locks_per_transaction') AS per_transaction")
+	if L.QueryString("SELECT current_setting('max_pred_locks_per_page') || ',' || current_setting('max_pred_locks_per_relation') || ',' || current_setting('max_pred_locks_per_transaction')") != "2,-2,64" {
+		t.Skip("the thresholds below assume the default max_pred_locks_* settings")
+	}
+	s := L.Session("T1")
+	s.Do("SET enable_seqscan = off")
+	s.Do("SET enable_bitmapscan = off")
+	heapLocks := func() string {
+		return s.Do(`SELECT string_agg(locktype || ' x' || n, ', ' ORDER BY locktype) FROM (
+  SELECT locktype, count(*) AS n FROM pg_locks
+  WHERE mode = 'SIReadLock' AND pid = pg_backend_pid() AND relation = 'pl'::regclass GROUP BY 1) x`).Str()
+	}
+	expect := func(want string) {
+		t.Helper()
+		if got := heapLocks(); got != want {
+			t.Fatalf("SIRead locks on pl: %s, want %s", got, want)
+		}
+	}
+	s.Do("BEGIN ISOLATION LEVEL SERIALIZABLE")
+	s.Do("SELECT length(pad) FROM pl WHERE id = 1")
+	expect("tuple x1")
+	s.Do("SELECT length(pad) FROM pl WHERE id = 2")
+	expect("tuple x2")
+	L.Note("a third tuple on the same page exceeds max_pred_locks_per_page = 2")
+	s.Do("SELECT length(pad) FROM pl WHERE id = 3")
+	expect("page x1")
+	L.Note("one row from each of many other pages exceeds max_pred_locks_per_relation (64 / 2 = 32)")
+	s.Do("SELECT count(pad) FROM pl WHERE id = ANY (SELECT g * 40 FROM generate_series(1, 40) g)")
+	expect("relation x1")
+	s.Do("COMMIT")
+}
+
+// 13.2.3: a READ ONLY serializable transaction that starts while no read-write serializable
+// transaction is active takes no predicate locks at all. A read-write one must keep its
+// SIRead locks past its own COMMIT, until the transactions that overlapped it are done.
+func TestIso_SER_PredicateLockLifetime(t *testing.T) {
+	L := newLab(t)
+	setupRows(L)
+	sireads := func() string {
+		return L.QueryString("SELECT count(*) FROM pg_locks WHERE mode = 'SIReadLock' AND relation IN ('r'::regclass, 'r_pkey'::regclass)")
+	}
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1.Do("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY")
+	t1.Do("SELECT * FROM r").MustOK()
+	if n := sireads(); n != "0" {
+		t.Fatalf("READ ONLY transaction with no concurrent writer holds %s SIRead locks, want 0", n)
+	}
+	t1.Do("COMMIT")
+
+	t2.Do("BEGIN ISOLATION LEVEL SERIALIZABLE")
+	t2.Do("SELECT 1")
+	t1.Do("BEGIN ISOLATION LEVEL SERIALIZABLE")
+	t1.Do("SELECT * FROM r").MustOK()
+	if sireads() == "0" {
+		t.Fatal("read-write transaction took no SIRead locks")
+	}
+	t1.Do("COMMIT")
+	L.Note("T1 committed, but T2 overlapped it and is still running")
+	L.ShowAs("pg_locks (SIReadLock)", "SELECT locktype, relation::regclass, pid FROM pg_locks WHERE mode = 'SIReadLock'")
+	if sireads() == "0" {
+		t.Fatal("SIRead locks were released at COMMIT although an overlapping transaction is still active")
+	}
+	t2.Do("COMMIT")
+	if n := sireads(); n != "0" {
+		t.Fatalf("%s SIRead locks left after the last overlapping transaction ended", n)
+	}
+}
+
+// 13.2.3: idle_in_transaction_session_timeout disconnects a session that sits idle inside a
+// transaction; its locks are released and its work is rolled back.
+func TestTx_IdleInTransactionSessionTimeout(t *testing.T) {
+	L := newLab(t)
+	setupRows(L)
+	idle, other := L.Session("IDLE"), L.Session("O")
+	idle.Do("SET idle_in_transaction_session_timeout = '300ms'")
+	idle.Do("BEGIN")
+	idle.Do("UPDATE r SET v = 1 WHERE id = 1")
+	waitBackendGone(t, L, idle.ID)
+	other.Do("UPDATE r SET v = v + 10 WHERE id = 1").MustNotBlock().MustAffect(1)
+	other.Do("SELECT v FROM r WHERE id = 1").MustRows("(10)")
+}
+
+func waitBackendGone(t *testing.T, L *lab.Lab, pid int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for L.QueryString("SELECT count(*) FROM pg_stat_activity WHERE pid = $1", pid) != "0" {
+		if time.Now().After(deadline) {
+			t.Fatalf("backend %d is still connected", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// 13.3.1: the commands that cannot run inside a transaction block. Their lock is read from
+// pg_locks while they wait for it behind a SHARE UPDATE EXCLUSIVE lock (which lets VACUUM's
+// initial ACCESS SHARE lookup through).
+func TestLock_TableLockRequestedByNonTransactionalCommands(t *testing.T) {
+	for _, c := range []struct{ sql, want string }{
+		{"VACUUM tl", "ShareUpdateExclusiveLock"},
+		{"CREATE INDEX CONCURRENTLY tl_c ON tl (v)", "ShareUpdateExclusiveLock"},
+		{"REINDEX TABLE CONCURRENTLY tl", "ShareUpdateExclusiveLock"},
+		{"VACUUM FULL tl", "AccessExclusiveLock"},
+	} {
+		t.Run(strings.ReplaceAll(c.sql, " ", "_"), func(t *testing.T) {
+			L := newLab(t)
+			L.Exec("DROP TABLE IF EXISTS tl2", "DROP TABLE IF EXISTS tl CASCADE",
+				"CREATE TABLE tl (id int primary key, v int)", "INSERT INTO tl VALUES (1, 0)")
+			t1, t2 := L.Session("T1"), L.Session("T2")
+			t1.Do("BEGIN")
+			t1.Do("LOCK TABLE tl IN SHARE UPDATE EXCLUSIVE MODE")
+			op := t2.Do(c.sql).MustBlock()
+			got := L.QueryString("SELECT mode FROM pg_locks WHERE pid = $1 AND NOT granted AND relation = 'tl'::regclass", t2.ID)
+			if got != c.want {
+				t.Errorf("%s waits for %s, want %s", c.sql, got, c.want)
+			}
+			t1.Do("ROLLBACK")
+			op.MustOK()
+		})
+	}
+}
+
+// 13.3.1: an error that escapes a PL/pgSQL exception block releases the locks taken inside
+// the block, like ROLLBACK TO SAVEPOINT does. Without the error the lock is kept.
+func TestLock_TableLockReleasedByExceptionBlock(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS tl2", "DROP TABLE IF EXISTS tl CASCADE", "CREATE TABLE tl (id int primary key)")
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1.Do("BEGIN")
+	t1.Do(`DO $$ BEGIN
+  LOCK TABLE tl IN ACCESS EXCLUSIVE MODE;
+  RAISE EXCEPTION 'leave the block';
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$`).MustOK()
+	t2.Do("SELECT count(*) FROM tl").MustNotBlock().MustOK()
+	t1.Do(`DO $$ BEGIN
+  LOCK TABLE tl IN ACCESS EXCLUSIVE MODE;
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$`).MustOK()
+	sel := t2.Do("SELECT count(*) FROM tl").MustBlock()
+	t1.Do("COMMIT")
+	sel.MustOK()
+}
+
+// 13.3.5: session-level advisory locks are cleaned up by the server when the session ends.
+func TestLock_AdvisoryReleasedAtSessionEnd(t *testing.T) {
+	L := newLab(t)
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1.Do("SELECT pg_advisory_lock(9)")
+	t2.Do("SELECT pg_try_advisory_lock(9)").MustRows("(false)")
+	L.Exec(fmt.Sprintf("SELECT pg_terminate_backend(%d)", t1.ID))
+	waitBackendGone(t, L, t1.ID)
+	t2.Do("SELECT pg_try_advisory_lock(9)").MustRows("(true)")
+	t2.Do("SELECT pg_advisory_unlock(9)")
 }

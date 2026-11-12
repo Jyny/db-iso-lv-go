@@ -8,6 +8,7 @@ package mysql
 // README §7 maps every subsection to the tests that cover it.
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"slices"
@@ -291,9 +292,13 @@ func TestLock_SpatialPredicateLock(t *testing.T) {
 	t2.Do("START TRANSACTION")
 	t2.Do("INSERT INTO geo VALUES (4, ST_GeomFromText('POINT(1000 1000)'))").MustNotBlock().MustOK()
 	ins := t2.Do("INSERT INTO geo VALUES (3, ST_GeomFromText('POINT(2 2)'))").MustBlock()
+	L.Note("moving an existing row into the MBR is blocked as well")
+	t3 := L.Session("T3")
+	mv := t3.Do("UPDATE geo SET g = ST_GeomFromText('POINT(3 3)') WHERE id = 2").MustBlock()
 	t1.Do("COMMIT")
 	ins.MustOK()
 	t2.Do("ROLLBACK")
+	mv.MustOK()
 }
 
 // 17.7.2.1 READ COMMITTED: the manual's semi-consistent read example, verbatim. With no
@@ -327,6 +332,15 @@ func TestLock_SemiConsistentReadDocsExample(t *testing.T) {
 				a.Begin(c.level)
 				a.Do("UPDATE sc SET b = 5 WHERE b = 3").MustAffect(2)
 				bStmt = "UPDATE sc SET b = 4 WHERE b = 2"
+				// READ COMMITTED keeps x-locks only on the two rows it changed; REPEATABLE
+				// READ keeps one on every row it read (5 rows + the supremum).
+				want := 2
+				if c.level == lab.RepeatableRead {
+					want = 6
+				}
+				if got := recordLocks(L.ShowLocks(), "A"); len(got) != want {
+					t.Fatalf("A holds %d record locks %v, want %d", len(got), got, want)
+				}
 			}
 			b.Begin(c.level)
 			op := b.Do(bStmt)
@@ -462,6 +476,7 @@ func TestLock_InsertSelectLocksSource(t *testing.T) {
 		for _, stmt := range []string{
 			"INSERT INTO dst SELECT id FROM t FORCE INDEX (PRIMARY) WHERE id <= 20",
 			"UPDATE dst SET id = id + 1000 WHERE id IN (SELECT id FROM t FORCE INDEX (PRIMARY) WHERE id <= 20)",
+			"REPLACE INTO dst SELECT id FROM t FORCE INDEX (PRIMARY) WHERE id <= 20",
 		} {
 			t.Run(level.Short()+"/"+strings.Fields(stmt)[0], func(t *testing.T) {
 				L := newLab(t)
@@ -517,6 +532,39 @@ func TestLock_LockingReadsDocs(t *testing.T) {
 		s2.Do("SELECT * FROM tn WHERE i = 2 FOR UPDATE NOWAIT").MustFail(func(err error) bool { return lab.Code(err) == "3572" })
 		s3.Do("START TRANSACTION")
 		s3.Do("SELECT * FROM tn FOR UPDATE SKIP LOCKED").MustRows("(1) (3)")
+		s3.Do("SELECT * FROM tn WHERE i = 2 FOR SHARE NOWAIT").MustFail(func(err error) bool { return lab.Code(err) == "3572" })
+		s3.Do("SELECT * FROM tn FOR SHARE SKIP LOCKED").MustRows("(1) (3)")
+		L.Note("the old spelling takes none of the new options")
+		s3.Do("SELECT * FROM tn WHERE i = 1 LOCK IN SHARE MODE NOWAIT").MustFail(func(err error) bool { return lab.Code(err) == "1064" })
+	})
+
+	t.Run("nowait-applies-to-row-locks-only", func(t *testing.T) {
+		L := newLab(t)
+		L.Exec("DROP TABLE IF EXISTS tn", "CREATE TABLE tn (i INT, PRIMARY KEY (i)) ENGINE = InnoDB", "INSERT INTO tn (i) VALUES (1),(2),(3)")
+		s1, s2 := L.Session("S1"), L.Session("S2")
+		s1.Do("LOCK TABLES tn WRITE")
+		L.Note("a table lock is not a row lock: NOWAIT waits for it")
+		nw := s2.Do("SELECT * FROM tn WHERE i = 2 FOR UPDATE NOWAIT").MustBlock()
+		s1.Do("UNLOCK TABLES")
+		nw.MustRows("(2)")
+	})
+
+	t.Run("nowait-skip-locked-unsafe-for-statement-binlog", func(t *testing.T) {
+		L := newLab(t)
+		if L.QueryString("SELECT @@log_bin") != "1" {
+			t.Skip("binary logging is off")
+		}
+		L.Exec("DROP TABLE IF EXISTS tn", "DROP TABLE IF EXISTS tn2", "CREATE TABLE tn (i INT, PRIMARY KEY (i)) ENGINE = InnoDB",
+			"CREATE TABLE tn2 (i INT)", "INSERT INTO tn (i) VALUES (1),(2),(3)")
+		s := L.Session("S")
+		s.Do("SET SESSION binlog_format = 'STATEMENT'")
+		s.Do("START TRANSACTION")
+		s.Do("INSERT INTO tn2 SELECT i FROM tn FOR UPDATE SKIP LOCKED").MustOK()
+		w := s.Do("SHOW WARNINGS").Text()
+		if !strings.Contains(w, "1592") {
+			t.Fatalf("expected the unsafe-statement warning 1592, got %q", w)
+		}
+		s.Do("ROLLBACK")
 	})
 
 	t.Run("lock-in-share-mode-equals-for-share", func(t *testing.T) {
@@ -579,6 +627,12 @@ func TestLock_LockingReadsDocs(t *testing.T) {
 		L.Exec("DROP TABLE IF EXISTS parent", "CREATE TABLE parent (id int PRIMARY KEY, name varchar(10))",
 			"INSERT INTO parent VALUES (1, 'Jones')")
 		t1, t2 := L.Session("T1"), L.Session("T2")
+		L.Note("a consistent read protects nothing: Jones can be deleted right after T1 saw it")
+		t1.Do("START TRANSACTION")
+		t1.Do("SELECT * FROM parent WHERE name = 'Jones'").MustRows("(1,Jones)")
+		t2.Do("DELETE FROM parent WHERE id = 1").MustNotBlock().MustAffect(1)
+		t1.Do("ROLLBACK")
+		t2.Do("INSERT INTO parent VALUES (1, 'Jones')")
 		t1.Do("START TRANSACTION")
 		t1.Do("SELECT * FROM parent WHERE name = 'Jones' FOR SHARE").MustRows("(1,Jones)")
 		L.Note("Jones cannot be deleted until T1 has inserted its child row and committed")
@@ -633,6 +687,13 @@ func TestLock_LockingReadsDocs(t *testing.T) {
 //   - delete-unique: deleting a parent row checks the FK in the child table; the empty child
 //     index gets a shared lock on its supremum (the manual's "shared record-level locks on
 //     the records examined", on the child side).
+//   - fk-check-fails-RC, delete-unique-RC: the manual says READ COMMITTED still uses gap locks
+//     for foreign-key checks. Neither check leaves one on 9.7: the failed child insert leaves
+//     nothing (REPEATABLE READ leaves S,GAP), the parent delete no lock in the child index.
+//   - for-update-*-nonmatching: the manual says a locking read releases the locks of rows that
+//     fail the WHERE clause. That happens only in READ COMMITTED, and not for a row found by a
+//     constant primary-key lookup; REPEATABLE READ keeps every lock. The UNION exception
+//     (rows stay locked) does not show up for this simple UNION.
 //   - insert-duplicate-unique: the clustered record for id 9 is inserted before the duplicate
 //     in uu is found. Rolling it back leaves its gap locked (lock inheritance): X on the
 //     PRIMARY supremum. odku-duplicate-unique leaves the same inherited lock.
@@ -664,6 +725,19 @@ func TestLock_LocksSetByStatement(t *testing.T) {
 		{"replace-collision", "REPLACE INTO t VALUES (20, 0, 0)", "", false, []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
 		{"fk-check", "INSERT INTO fkc VALUES (1, 20)", "", false, []string{"t.PRIMARY S,REC_NOT_GAP 20"}},
 		{"fk-check-fails", "INSERT INTO fkc VALUES (1, 25)", "", true, []string{"t.PRIMARY S,GAP 30"}},
+		{"fk-check-fails-RC", "INSERT INTO fkc VALUES (1, 25)", lab.ReadCommitted, true, nil},
+		{"delete-unique-RC", "DELETE FROM t WHERE id = 20", lab.ReadCommitted, false, []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
+		{"update-range-RC", "UPDATE t SET v = 1 WHERE id > 15", lab.ReadCommitted, false,
+			[]string{"t.PRIMARY X,REC_NOT_GAP 20", "t.PRIMARY X,REC_NOT_GAP 30"}},
+		{"for-update-const-nonmatching", "SELECT * FROM t WHERE id = 20 AND v = 99 FOR UPDATE", "", false, []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
+		{"for-update-const-nonmatching-RC", "SELECT * FROM t WHERE id = 20 AND v = 99 FOR UPDATE", lab.ReadCommitted, false, []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
+		{"for-update-range-nonmatching", "SELECT * FROM t WHERE id >= 20 AND v = 99 FOR UPDATE", "", false,
+			[]string{"t.PRIMARY X 30", "t.PRIMARY X supremum pseudo-record", "t.PRIMARY X,REC_NOT_GAP 20"}},
+		{"for-update-range-nonmatching-RC", "SELECT * FROM t WHERE id >= 20 AND v = 99 FOR UPDATE", lab.ReadCommitted, false, nil},
+		{"for-update-union-nonmatching-RC", "(SELECT * FROM t WHERE id >= 20 AND v = 99 FOR UPDATE) UNION (SELECT * FROM t WHERE id <= 10 AND v = 99 FOR UPDATE)", lab.ReadCommitted, false, nil},
+		{"replace-collision-unique", "REPLACE INTO tu VALUES (9, 20, 0)", "", false,
+			[]string{"tu.PRIMARY X supremum pseudo-record", "tu.PRIMARY X,GAP 9", "tu.PRIMARY X,REC_NOT_GAP 2",
+				"tu.uu X 20, 2", "tu.uu X 30, 3", "tu.uu X,GAP 20, 9"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -726,16 +800,48 @@ func TestDeadlock_ManualAnimalsBirds(t *testing.T) {
 	locks := L.ShowLocks()
 	mustHaveLock(t, locks, "A", "IS", "")
 	mustHaveLock(t, locks, "A", "S,REC_NOT_GAP", "'Aardvark'")
+	mustHaveLock(t, locks, "B", "IS", "")
 	mustHaveLock(t, locks, "B", "S,REC_NOT_GAP", "'Buzzard'")
+	if len(locks) != 4 {
+		t.Fatalf("data_locks has %d rows, the manual shows 4: %v", len(locks), locks)
+	}
 	upd := b.Do("UPDATE Animals SET value=30 WHERE name='Aardvark'").MustBlock()
-	L.Show(`SELECT REQUESTING_ENGINE_TRANSACTION_ID AS req_trx, BLOCKING_ENGINE_TRANSACTION_ID AS blk_trx
-FROM performance_schema.data_lock_waits`)
+	locks = L.ShowLocks()
+	mustHaveLock(t, locks, "B", "IX", "")
+	if k, ok := lab.FindLock(locks, "B", "X,REC_NOT_GAP", "'Aardvark'"); !ok || k.Granted {
+		t.Fatalf("B should be WAITING for X,REC_NOT_GAP on 'Aardvark': %v", locks)
+	}
+	if len(locks) != 6 {
+		t.Fatalf("data_locks has %d rows, the manual shows 6: %v", len(locks), locks)
+	}
+	waits := L.Show(`SELECT r.PROCESSLIST_ID AS requesting, b.PROCESSLIST_ID AS blocking
+FROM performance_schema.data_lock_waits w
+JOIN performance_schema.threads r ON r.THREAD_ID = w.REQUESTING_THREAD_ID
+JOIN performance_schema.threads b ON b.THREAD_ID = w.BLOCKING_THREAD_ID`)
+	if len(waits) != 1 || waits[0][0] != fmt.Sprint(b.ID) || waits[0][1] != fmt.Sprint(a.ID) {
+		t.Fatalf("data_lock_waits = %v, want one row: B (%d) waiting for A (%d)", waits, b.ID, a.ID)
+	}
 	dl := a.Do("UPDATE Birds SET value=40 WHERE name='Buzzard'")
 	dl.MustFail(lab.IsDeadlock)
 	if !strings.Contains(lab.Describe(dl.Err), "ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction") {
 		t.Fatalf("unexpected error text: %s", lab.Describe(dl.Err))
 	}
 	L.ShowDeadlock(dl)
+	status := L.Query("SHOW ENGINE INNODB STATUS")[0][2]
+	if i := strings.Index(status, "LATEST DETECTED DEADLOCK"); i < 0 {
+		t.Fatal("SHOW ENGINE INNODB STATUS has no LATEST DETECTED DEADLOCK section")
+	} else {
+		status = status[i:]
+	}
+	for _, want := range []string{
+		"UPDATE Animals SET value=30 WHERE name='Aardvark'", "UPDATE Birds SET value=40 WHERE name='Buzzard'",
+		"lock mode S locks rec but not gap", "lock_mode X locks rec but not gap waiting",
+		"*** WE ROLL BACK TRANSACTION (2)",
+	} {
+		if !strings.Contains(status, want) {
+			t.Errorf("LATEST DETECTED DEADLOCK does not contain %q", want)
+		}
+	}
 	upd.MustAffect(1)
 	b.Do("COMMIT")
 
@@ -961,6 +1067,11 @@ func TestLock_InnoDBTableLocksVariable(t *testing.T) {
 		}
 		return ""
 	}
+	s.Do("LOCK TABLES t WRITE")
+	if got := innodbTableLock(); got != "" {
+		t.Errorf("autocommit = 1: InnoDB table lock %q, want none (it is released at once)", got)
+	}
+	s.Do("UNLOCK TABLES")
 	s.Do("SET autocommit = 0")
 	for _, c := range []struct{ setting, stmt, want string }{
 		{"1", "LOCK TABLES t READ", "S"},
@@ -1112,5 +1223,342 @@ func TestLock_LockingReadPrivileges(t *testing.T) {
 		} else {
 			L.Note("FOR UPDATE with SELECT + %s: ok", strings.Fields(grant)[0])
 		}
+	}
+}
+
+// 17.7.1: the lock descriptions the manual quotes from SHOW ENGINE INNODB STATUS (with
+// innodb_status_output_locks = ON), on the manual's child table (90, 102).
+func TestLock_MonitorOutputDocsExamples(t *testing.T) {
+	L := newLab(t)
+	setGlobal(t, L, "innodb_status_output_locks", "ON")
+	L.Exec("DROP TABLE IF EXISTS child", "CREATE TABLE child (id int NOT NULL, PRIMARY KEY (id))",
+		"INSERT INTO child (id) VALUES (90), (102)")
+	a, b := L.Session("A"), L.Session("B")
+	a.Do("START TRANSACTION")
+	a.Do("SELECT * FROM child WHERE id = 90 FOR UPDATE")
+	a.Do("SELECT * FROM child WHERE id > 100 FOR UPDATE")
+	b.Do("START TRANSACTION")
+	ins := b.Do("INSERT INTO child (id) VALUES (101)").MustBlock()
+	status := L.Query("SHOW ENGINE INNODB STATUS")[0][2]
+	for what, want := range map[string]string{
+		"intention lock":        "TABLE LOCK table `" + dbname + "`.`child` trx id",
+		"intention lock mode":   "lock mode IX",
+		"record lock":           "lock_mode X locks rec but not gap",
+		"record lock header":    "index PRIMARY of table `" + dbname + "`.`child`",
+		"next-key lock":         "lock_mode X\n",
+		"supremum":              "supremum",
+		"insert intention lock": "lock_mode X locks gap before rec insert intention waiting",
+	} {
+		if !strings.Contains(status, want) {
+			t.Errorf("%s: monitor output does not contain %q", what, want)
+		}
+	}
+	if t.Failed() {
+		if i := strings.Index(status, "\nTRANSACTIONS\n"); i >= 0 {
+			t.Log(status[i:min(len(status), i+6000)])
+		}
+	}
+	a.Do("ROLLBACK")
+	ins.MustOK()
+	b.Do("ROLLBACK")
+}
+
+// 17.7.2: lock information is stored compactly, so InnoDB never escalates row locks to a
+// table lock. A transaction that locks every one of 10,000 rows still holds 10,000 record
+// locks and only an intention lock on the table, and others can keep inserting.
+func TestLock_NoLockEscalation(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS big", "DROP TABLE IF EXISTS dg", "CREATE TABLE dg (n int)",
+		"INSERT INTO dg VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)",
+		"CREATE TABLE big (id int PRIMARY KEY, v int)",
+		"INSERT INTO big SELECT a.n + 10 * b.n + 100 * c.n + 1000 * d.n + 1, 0 FROM dg a, dg b, dg c, dg d")
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1.Begin(lab.ReadCommitted)
+	t1.Do("UPDATE big SET v = 1").MustAffect(10000)
+	got := L.Show(`SELECT LOCK_TYPE, LOCK_MODE, count(*) FROM performance_schema.data_locks
+WHERE OBJECT_SCHEMA = DATABASE() AND OBJECT_NAME = 'big' GROUP BY 1, 2 ORDER BY 1, 2`)
+	if lab.FormatRows(got) != "(RECORD,X,REC_NOT_GAP,10000) (TABLE,IX,1)" {
+		t.Fatalf("locks on big: %s, want 10000 record locks and one IX", lab.FormatRows(got))
+	}
+	t2.Do("INSERT INTO big VALUES (10001, 0)").MustNotBlock().MustOK()
+	t1.Do("ROLLBACK")
+}
+
+// 17.7.2.1: REPEATABLE READ is the default level. SET SESSION TRANSACTION changes it for
+// this session only; SET GLOBAL changes it for connections made afterwards.
+// The global part runs on connections of its own, and nothing else touches the server while
+// the global level is changed, so that no pooled connection starts life at SERIALIZABLE.
+func TestTx_IsolationLevelDefaultAndScope(t *testing.T) {
+	L := newLab(t)
+	if g := L.QueryString("SELECT @@GLOBAL.transaction_isolation"); g != "REPEATABLE-READ" {
+		t.Skipf("the server was started with transaction_isolation = %s", g)
+	}
+	s, other := L.Session("S"), L.Session("O")
+	s.Do("SELECT @@transaction_isolation").MustRows("(REPEATABLE-READ)")
+	s.Do("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+	s.Do("SELECT @@transaction_isolation").MustRows("(READ-COMMITTED)")
+	other.Do("SELECT @@transaction_isolation").MustRows("(REPEATABLE-READ)")
+
+	db, err := sql.Open("mysql", lab.DSN(lab.MySQL, dbname))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := t.Context()
+	level := func(c *sql.Conn) string {
+		t.Helper()
+		var v string
+		if err := c.QueryRowContext(ctx, "SELECT @@transaction_isolation").Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	old, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	if _, err := old.ExecContext(ctx, "SET GLOBAL transaction_isolation = 'SERIALIZABLE'"); err != nil {
+		t.Fatal(err)
+	}
+	defer old.ExecContext(context.Background(), "SET GLOBAL transaction_isolation = 'REPEATABLE-READ'")
+	fresh, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	got := [2]string{level(old), level(fresh)}
+	if _, err := old.ExecContext(ctx, "SET GLOBAL transaction_isolation = 'REPEATABLE-READ'"); err != nil {
+		t.Fatal(err)
+	}
+	L.Note("after SET GLOBAL ... SERIALIZABLE: the existing connection stays at %s, a new one starts at %s", got[0], got[1])
+	if got != [2]string{"REPEATABLE-READ", "SERIALIZABLE"} {
+		t.Fatalf("existing / new connection at %v, want REPEATABLE-READ / SERIALIZABLE", got)
+	}
+}
+
+// 17.7.2.1 READ COMMITTED: DELETE also keeps locks only on the rows it deletes, but the
+// semi-consistent read is for UPDATE only: a second DELETE waits at the first locked row
+// where an UPDATE would have skipped it.
+func TestLock_RC_DeleteReleasesNonMatchingRowsButWaits(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS sc", "CREATE TABLE sc (a INT NOT NULL, b INT) ENGINE = InnoDB",
+		"INSERT INTO sc VALUES (1,2),(2,3),(3,2),(4,3),(5,2)")
+	a, b := L.Session("A"), L.Session("B")
+	a.Begin(lab.ReadCommitted)
+	a.Do("DELETE FROM sc WHERE b = 3").MustAffect(2)
+	if got := recordLocks(L.ShowLocks(), "A"); len(got) != 2 {
+		t.Fatalf("A holds %d record locks %v, want 2", len(got), got)
+	}
+	b.Begin(lab.ReadCommitted)
+	del := b.Do("DELETE FROM sc WHERE b = 2").MustBlock()
+	a.Do("COMMIT")
+	del.MustAffect(3)
+	b.Do("COMMIT")
+}
+
+// 17.7.2.3: rows deleted, updated or inserted by transactions that commit after the
+// snapshot's timepoint look unchanged to the snapshot.
+func TestMVCC_SnapshotIgnoresLaterDeleteUpdateInsert(t *testing.T) {
+	L := newLab(t)
+	setupT(L)
+	a, b := L.Session("A"), L.Session("B")
+	a.Do("START TRANSACTION")
+	a.Do("SELECT id, v FROM t ORDER BY id").MustRows("(10,0) (20,0) (30,0)")
+	b.Do("DELETE FROM t WHERE id = 10")
+	b.Do("UPDATE t SET v = 9 WHERE id = 20")
+	b.Do("INSERT INTO t VALUES (40, 40, 0)")
+	a.Do("SELECT id, v FROM t ORDER BY id").MustRows("(10,0) (20,0) (30,0)")
+	a.Do("COMMIT")
+	a.Do("SELECT id, v FROM t ORDER BY id").MustRows("(20,9) (30,0) (40,0)")
+}
+
+// 17.7.2.3 / 17.7.3: CREATE TABLE ... SELECT reads its source like INSERT ... SELECT: with
+// shared locks in REPEATABLE READ (so it waits for a writer), as a consistent read in READ
+// COMMITTED.
+func TestLock_CreateTableSelectLocksSource(t *testing.T) {
+	for _, level := range []lab.Level{lab.RepeatableRead, lab.ReadCommitted} {
+		t.Run(level.Short(), func(t *testing.T) {
+			L := newLab(t)
+			setupT(L)
+			L.Exec("DROP TABLE IF EXISTS ctas")
+			w, c := L.Session("W"), L.Session("C")
+			w.Do("START TRANSACTION")
+			w.Do("UPDATE t SET v = 1 WHERE id = 10")
+			c.Do("SET SESSION TRANSACTION ISOLATION LEVEL " + string(level))
+			op := c.Do("CREATE TABLE ctas AS SELECT id, v FROM t")
+			if level == lab.RepeatableRead {
+				op.MustBlock()
+				mustHaveLock(t, L.ShowLocks(), "C", "S", "10")
+				w.Do("COMMIT")
+				op.MustOK()
+				c.Do("SELECT v FROM ctas WHERE id = 10").MustRows("(1)")
+			} else {
+				op.MustNotBlock().MustOK()
+				c.Do("SELECT v FROM ctas WHERE id = 10").MustRows("(0)")
+				w.Do("COMMIT")
+			}
+		})
+	}
+}
+
+// 17.7.3 INSERT / UPDATE: the lock on a freshly inserted row, and on the secondary index
+// entries an UPDATE touches, is implicit: nothing is listed in data_locks until another
+// transaction runs into it, and then it shows up as an explicit record lock. The inserted
+// row's lock is a record lock without a gap, so the gap before it stays open.
+func TestLock_InsertAndUpdateImplicitLocks(t *testing.T) {
+	L := newLab(t)
+	setupT(L)
+	L.Exec("DROP TABLE IF EXISTS tu", "CREATE TABLE tu (id int PRIMARY KEY, u int, v int, UNIQUE KEY uu (u))",
+		"INSERT INTO tu VALUES (1, 10, 0), (2, 20, 0), (3, 30, 0)")
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1.Do("START TRANSACTION")
+	t1.Do("INSERT INTO t VALUES (25, 25, 0)")
+	if got := recordLocks(L.ShowLocks(), "T1"); len(got) != 0 {
+		t.Fatalf("explicit record locks after INSERT: %v, want none", got)
+	}
+	t2.Do("START TRANSACTION")
+	t2.Do("INSERT INTO t VALUES (24, 24, 0)").MustNotBlock().MustOK()
+	rd := t2.Do("SELECT id FROM t WHERE id = 25 FOR SHARE").MustBlock()
+	mustHaveLock(t, L.ShowLocks(), "T1", "X,REC_NOT_GAP", "25")
+	t1.Do("COMMIT")
+	rd.MustRows("(25)")
+	t2.Do("ROLLBACK")
+
+	t1.Do("START TRANSACTION")
+	t1.Do("UPDATE tu SET u = 25 WHERE id = 2")
+	if got, want := recordLocks(L.ShowLocks(), "T1"), []string{"X,REC_NOT_GAP 2"}; !slices.Equal(got, want) {
+		t.Fatalf("explicit record locks after UPDATE: %v, want %v (only the clustered record)", got, want)
+	}
+	t2.Do("START TRANSACTION")
+	rd = t2.Do("SELECT id FROM tu FORCE INDEX (uu) WHERE u = 25 FOR SHARE").MustBlock()
+	mustHaveLock(t, L.ShowLocks(), "T1", "X,REC_NOT_GAP", "25, 2")
+	t1.Do("COMMIT")
+	rd.MustRows("(2)")
+	t2.Do("ROLLBACK")
+}
+
+// 17.7.5: "the possibility of deadlocks is not affected by the isolation level": two
+// transactions that update the same two rows in opposite order deadlock at every level.
+func TestDeadlock_AtEveryIsolationLevel(t *testing.T) {
+	for _, level := range lab.AllLevels {
+		t.Run(level.Short(), func(t *testing.T) {
+			L := newLab(t)
+			setupT(L)
+			t1, t2 := L.Session("T1"), L.Session("T2")
+			t1.Begin(level)
+			t2.Begin(level)
+			t1.Do("UPDATE t SET v = 1 WHERE id = 10")
+			t2.Do("UPDATE t SET v = 2 WHERE id = 20")
+			a := t1.Do("UPDATE t SET v = 1 WHERE id = 20")
+			b := t2.Do("UPDATE t SET v = 2 WHERE id = 10")
+			lab.ExpectOneDeadlockVictim(t, a, b)
+			t1.Do("ROLLBACK")
+			t2.Do("ROLLBACK")
+		})
+	}
+}
+
+// 17.7.5.2: InnoDB cannot detect a deadlock that involves a lock set by another storage
+// engine. T2 holds MyISAM's table lock on my and waits for T1's InnoDB row lock; T1 waits
+// for the MyISAM table lock. Nothing reports a deadlock: the cycle ends only when T2's
+// innodb_lock_wait_timeout expires.
+func TestDeadlock_UndetectedAcrossStorageEngines(t *testing.T) {
+	L := newLab(t)
+	setupT(L)
+	L.Exec("DROP TABLE IF EXISTS my", "CREATE TABLE my (id int) ENGINE = MyISAM", "INSERT INTO my VALUES (10)")
+	deadlocks := func() string {
+		return L.QueryString(`SELECT count FROM information_schema.INNODB_METRICS WHERE NAME = "lock_deadlocks"`)
+	}
+	before := deadlocks()
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t2.Do("SET SESSION innodb_lock_wait_timeout = 2")
+	t1.Do("START TRANSACTION")
+	t1.Do("UPDATE t SET v = 1 WHERE id = 10")
+	sel := t2.Do("UPDATE my SET id = id + 1 WHERE id IN (SELECT id FROM t WHERE id = 10)").MustBlock()
+	rd := t1.Do("SELECT id FROM my").MustBlock()
+	L.Show("SELECT ID, STATE, INFO FROM performance_schema.processlist WHERE ID IN (?, ?) ORDER BY ID", t1.ID, t2.ID)
+	sel.MustFail(func(err error) bool { return lab.Code(err) == "1205" })
+	rd.MustRows("(10)")
+	t1.Do("ROLLBACK")
+	if after := deadlocks(); after != before {
+		t.Fatalf("lock_deadlocks went from %s to %s: InnoDB should not have seen this cycle", before, after)
+	}
+}
+
+// 17.7.6: among waiters of equal weight the one that has waited longest gets the lock.
+// The INNODB_METRICS counters the section lists count the scheduler's work.
+func TestLock_CATSEqualWeightIsFIFO(t *testing.T) {
+	L := newLab(t)
+	setupT(L)
+	counters := []string{"lock_rec_release_attempts", "lock_rec_grant_attempts", "lock_schedule_refreshes"}
+	for _, c := range counters {
+		if L.QueryString("SELECT status FROM information_schema.INNODB_METRICS WHERE NAME = ?", c) != "enabled" {
+			L.Exec("SET GLOBAL innodb_monitor_enable = '" + c + "'")
+			t.Cleanup(func() { _, _ = L.Admin.Exec("SET GLOBAL innodb_monitor_disable = '" + c + "'") })
+		}
+	}
+	read := func() map[string]int {
+		m := map[string]int{}
+		for _, r := range L.Query("SELECT NAME, COUNT FROM information_schema.INNODB_METRICS WHERE NAME LIKE 'lock_rec_%_attempts' OR NAME = 'lock_schedule_refreshes'") {
+			var n int
+			fmt.Sscan(r[1], &n)
+			m[r[0]] = n
+		}
+		return m
+	}
+	before := read()
+	holder, w1, w2 := L.Session("H"), L.Session("W1"), L.Session("W2")
+	for _, s := range []*lab.Session{holder, w1, w2} {
+		s.Do("START TRANSACTION")
+	}
+	holder.Do("UPDATE t SET v = 1 WHERE id = 10")
+	first := w1.Do("UPDATE t SET v = 2 WHERE id = 10").MustBlock()
+	second := w2.Do("UPDATE t SET v = 3 WHERE id = 10").MustBlock()
+	holder.Do("COMMIT")
+	first.MustOK()
+	L.Settle()
+	second.MustBlock()
+	w1.Do("COMMIT")
+	second.MustOK()
+	w2.Do("COMMIT")
+	after := read()
+	L.Note("scheduler counters: before %v, after %v", before, after)
+	if len(after) != len(counters) {
+		t.Fatalf("INNODB_METRICS has %d of the 3 scheduling counters: %v", len(after), after)
+	}
+	for _, c := range []string{"lock_rec_release_attempts", "lock_rec_grant_attempts"} {
+		if after[c] <= before[c] {
+			t.Errorf("%s did not increase: %d → %d", c, before[c], after[c])
+		}
+	}
+}
+
+// 17.7.5.2 / 17.7.5.3: the manual says InnoDB cannot detect a deadlock that involves a
+// LOCK TABLES table lock, so only a timeout resolves it. InnoDB indeed does not see this
+// one (lock_deadlocks stays put), but on 9.7 LOCK TABLES waits on metadata locks, and the
+// metadata lock subsystem has a deadlock detector of its own: T1 fails at once with the
+// same ERROR 1213 and is rolled back.
+// (LOCK TABLES takes its metadata locks in name order: it holds aa while it waits for t.)
+func TestDeadlock_LockTablesDetectedByMetadataLocks(t *testing.T) {
+	L := newLab(t)
+	setupT(L)
+	L.Exec("DROP TABLE IF EXISTS aa", "CREATE TABLE aa (id int PRIMARY KEY, v int)", "INSERT INTO aa VALUES (1, 0)")
+	deadlocks := func() string {
+		return L.QueryString(`SELECT count FROM information_schema.INNODB_METRICS WHERE NAME = "lock_deadlocks"`)
+	}
+	before := deadlocks()
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t2.Do("SET autocommit = 0")
+	t1.Do("START TRANSACTION")
+	t1.Do("UPDATE t SET v = 1 WHERE id = 10")
+	lock := t2.Do("LOCK TABLES aa WRITE, t WRITE").MustBlock()
+	L.ShowMetadataLocks()
+	t1.Do("UPDATE aa SET v = 1 WHERE id = 1").MustFail(lab.IsDeadlock)
+	lock.MustOK()
+	t2.Do("SELECT v FROM t WHERE id = 10").MustRows("(0)")
+	t2.Do("UNLOCK TABLES")
+	if after := deadlocks(); after != before {
+		t.Fatalf("lock_deadlocks went from %s to %s: this deadlock is not InnoDB's to detect", before, after)
 	}
 }

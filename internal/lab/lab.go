@@ -98,6 +98,10 @@ func dsn(kind Kind, dbname string) string {
 	panic("unknown kind " + kind)
 }
 
+// DSN returns the DSN of database dbname, for experiments that need a connection of their
+// own, outside the shared pool.
+func DSN(kind Kind, dbname string) string { return dsn(kind, dbname) }
+
 // DSNAs returns the DSN of database dbname with the user and password replaced, for
 // experiments that need a connection with fewer privileges.
 func DSNAs(kind Kind, dbname, user, password string) string {
