@@ -259,19 +259,29 @@ func TestDeadlock(t *testing.T) {
 			}
 			L.Settle()
 
-			var victim *lab.Op
+			// Statements still blocked are fine (they wait for a survivor to commit). Of those
+			// that finished, a deadlock fails exactly one, and nothing fails otherwise.
+			var victims []*lab.Op
 			for _, op := range ops {
-				if op.Done() && op.Err != nil && lab.IsDeadlock(op.Err) && !op.Skipped {
-					victim = op
+				switch {
+				case !op.Done() || op.Err == nil || op.Skipped:
+				case lab.IsDeadlock(op.Err):
+					victims = append(victims, op)
+				default:
+					t.Errorf("#%d %s: %q failed with %s", op.Seq, op.S.Name, op.SQL, lab.Describe(op.Err))
 				}
 			}
-			if victim != nil {
-				L.ShowDeadlock(victim)
+			want := 0
+			if c.deadlock {
+				want = 1
+			}
+			if len(victims) != want {
+				t.Errorf("%d deadlock victim(s), want %d", len(victims), want)
+			}
+			if len(victims) > 0 {
+				L.ShowDeadlock(victims[0])
 			} else {
 				L.ShowLocks()
-			}
-			if got := victim != nil; got != c.deadlock {
-				t.Errorf("deadlock = %v, want %v", got, c.deadlock)
 			}
 		})
 	}

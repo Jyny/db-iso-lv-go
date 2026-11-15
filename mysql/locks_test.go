@@ -12,7 +12,7 @@ import (
 //	X,REC_NOT_GAP         record lock: just the index record
 //	X,GAP                 gap lock: the open interval BEFORE the record, not the record
 //	X                     next-key lock: record + the gap before it, i.e. (prev, rec]
-//	X,INSERT_INTENTION    an insert waiting for a gap lock held by someone else
+//	X,GAP,INSERT_INTENTION  an insert waiting for a gap lock held by someone else
 //	"supremum pseudo-record"  the +∞ record of a page; X on it locks the gap to +∞
 //
 // Gap locks never conflict with each other; they only block inserts (insert intention).
@@ -59,7 +59,8 @@ func TestLock_GapLockOnMissingKey(t *testing.T) {
 }
 
 // Range scan on the PK: next-key locks on matching records plus a gap lock on the record
-// that ends the scan. Inserts anywhere in [15, 30) block; beyond 30 they don't.
+// that ends the scan: (10, 20] + (20, 30). Inserts anywhere in (10, 30) block, also below
+// the range's start at 15; 30 itself and beyond are free.
 func TestLock_NextKeyRangeOnPK(t *testing.T) {
 	L := newLab(t)
 	setupT(L)
@@ -198,7 +199,8 @@ func TestLock_SharedExclusiveNowaitSkipLocked(t *testing.T) {
 }
 
 // Plain SELECT is a non-locking consistent read: it reads the undo version and never waits
-// for row locks. In SERIALIZABLE (with autocommit off) InnoDB turns it into SELECT ... FOR SHARE.
+// for row locks. In SERIALIZABLE, inside a transaction (BEGIN here, or autocommit = 0:
+// TestIso_SER_AutocommitSelectStaysNonLocking), InnoDB turns it into SELECT ... FOR SHARE.
 func TestLock_PlainSelectIsNonLocking(t *testing.T) {
 	for _, level := range []lab.Level{lab.RepeatableRead, lab.Serializable} {
 		t.Run(level.Short(), func(t *testing.T) {

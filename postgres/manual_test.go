@@ -90,7 +90,10 @@ func TestIso_RC_WaitThenRecheck(t *testing.T) {
 }
 
 // 13.2.1: INSERT ... ON CONFLICT DO UPDATE always ends in an insert or an update, even when
-// the conflicting row is uncommitted when it starts; DO NOTHING skips it.
+// the conflicting row is uncommitted when it starts; DO NOTHING skips it. "The UPDATE clause
+// will affect that row, even though possibly no version of that row is conventionally
+// visible to the command": the RETURNING subquery runs on the statement's snapshot, taken
+// before T1 committed, and still counts an empty table.
 func TestIso_RC_InsertOnConflict(t *testing.T) {
 	L := newLab(t)
 	L.Exec("DROP TABLE IF EXISTS kv", "CREATE TABLE kv (k int primary key, v text)")
@@ -98,10 +101,10 @@ func TestIso_RC_InsertOnConflict(t *testing.T) {
 
 	t1.Do("BEGIN")
 	t1.Do("INSERT INTO kv VALUES (1, 't1')")
-	up := t2.Do("INSERT INTO kv VALUES (1, 't2') ON CONFLICT (k) DO UPDATE SET v = excluded.v").MustBlock()
+	up := t2.Do("INSERT INTO kv VALUES (1, 't2') ON CONFLICT (k) DO UPDATE SET v = excluded.v RETURNING v, (SELECT count(*) FROM kv)").MustBlock()
 	t1.Do("COMMIT")
-	L.Note("T1's row became visible after the wait, so T2 took the UPDATE path")
-	up.MustAffect(1)
+	L.Note("T2 took the UPDATE path on T1's row, which its own snapshot cannot see")
+	up.MustRows("(t2,0)")
 	t2.Do("SELECT v FROM kv WHERE k = 1").MustRows("(t2)")
 
 	t1.Do("BEGIN")
@@ -131,6 +134,8 @@ WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.v)`).MustBlock()
 // 13.2.2 / 13.3.2: in REPEATABLE READ, touching a row that a concurrent transaction changed
 // after our snapshot fails with 40001, unless that transaction rolled back or only LOCKED the
 // row. 13.4.2: a no-op UPDATE under the lock is what makes the conflict stick.
+// (The docs quote one message, "... due to concurrent update", for a row that was "updated
+// or deleted". A committed DELETE reports "... due to concurrent delete"; the SQLSTATE is the same.)
 func TestIso_RR_ConcurrentChangeOutcomes(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -179,6 +184,41 @@ func TestIso_RR_ConcurrentChangeOutcomes(t *testing.T) {
 			}
 			t2.Do("ROLLBACK")
 		})
+	}
+
+	// 13.3.2: "Within a REPEATABLE READ or SERIALIZABLE transaction, however, an error will be
+	// thrown if a row to be locked has changed since the transaction started", also when the
+	// change committed before the locking read, so there is nothing to wait for. FOR KEY SHARE
+	// is the exception: it fails only if the key changed or the row was deleted. Over a
+	// committed non-key UPDATE it succeeds and returns the snapshot's version of the row.
+	for _, level := range []lab.Level{lab.RepeatableRead, lab.Serializable} {
+		for _, c := range []struct{ change, mode string }{
+			{"UPDATE r SET v = 1 WHERE id = 1", "FOR UPDATE"},
+			{"UPDATE r SET v = 1 WHERE id = 1", "FOR NO KEY UPDATE"},
+			{"UPDATE r SET v = 1 WHERE id = 1", "FOR SHARE"},
+			{"UPDATE r SET v = 1 WHERE id = 1", "FOR KEY SHARE"},
+			{"UPDATE r SET id = 3 WHERE id = 1", "FOR KEY SHARE"},
+			{"DELETE FROM r WHERE id = 1", "FOR KEY SHARE"},
+		} {
+			name := fmt.Sprintf("changed-before/%s/%s/%s", level.Short(), strings.Fields(c.change)[0]+"-"+strings.Fields(c.change)[3], strings.ReplaceAll(c.mode, " ", "-"))
+			t.Run(name, func(t *testing.T) {
+				L := newLab(t)
+				setupRows(L)
+				t1, t2 := L.Session("T1"), L.Session("T2")
+				t2.Begin(level)
+				t2.Do("SELECT v FROM r WHERE id = 1").MustRows("(0)")
+				t1.Do(c.change).MustAffect(1)
+				op := t2.Do("SELECT v FROM r WHERE id = 1 " + c.mode).MustNotBlock()
+				if c.mode == "FOR KEY SHARE" && strings.HasPrefix(c.change, "UPDATE r SET v") {
+					op.MustRows("(0)")
+					L.Note("the lock is on a row version T1 has replaced; writing the row still fails")
+					t2.Do("UPDATE r SET v = 5 WHERE id = 1").MustFail(lab.IsSerialization)
+				} else {
+					op.MustFail(lab.IsSerialization)
+				}
+				t2.Do("ROLLBACK")
+			})
+		}
 	}
 
 	t.Run("read-only-never-conflicts", func(t *testing.T) {
@@ -245,6 +285,64 @@ func TestIso_SER_ReadOnlyDeferrable(t *testing.T) {
 	rw.Do("COMMIT")
 	sel.MustRows("(0)")
 	ro.Do("COMMIT")
+}
+
+// 13.2.3: data read in a SERIALIZABLE transaction is not valid until the transaction has
+// committed, "even for read-only transactions, except that data read within a deferrable
+// read-only transaction is known to be valid as soon as it is read".
+//
+// The deposit report (Fekete's read-only anomaly, with the pivot committing early): T1 adds a
+// receipt to batch 1 after reading the batch number, T2 closes batch 1. RO then sees batch 1
+// closed. T1 can still commit (serial order T1 → T2), but after that no serial order has room
+// for RO: it saw T2's work and not T1's.
+//   - READ ONLY: what it already read (batch 1 is closed) turns out to be invalid; its next
+//     read fails with 40001.
+//   - READ ONLY DEFERRABLE: it waits for T1 at its first statement. T1's commit proves the
+//     snapshot it had taken unsafe, so, unlike in TestIso_SER_ReadOnlyDeferrable, it takes a
+//     new one: it sees T1's receipt and cannot fail.
+func TestIso_SER_ReadOnlyCanFailDeferrableCannot(t *testing.T) {
+	for _, deferrable := range []bool{false, true} {
+		name := "read-only"
+		if deferrable {
+			name = "deferrable"
+		}
+		t.Run(name, func(t *testing.T) {
+			L := newLab(t)
+			L.Exec("DROP TABLE IF EXISTS control", "DROP TABLE IF EXISTS receipt",
+				"CREATE TABLE control (deposit_no int)", "INSERT INTO control VALUES (1)",
+				"CREATE TABLE receipt (deposit_no int, amount int)")
+			t1, t2, ro := L.Session("T1"), L.Session("T2"), L.Session("RO")
+			t1.Begin(lab.Serializable)
+			t1.Do("SELECT deposit_no FROM control").MustRows("(1)")
+			t1.Do("INSERT INTO receipt VALUES (1, 100)").MustOK()
+			t2.Begin(lab.Serializable)
+			t2.Do("UPDATE control SET deposit_no = 2").MustAffect(1)
+			t2.Do("COMMIT").MustOK()
+
+			const total = "SELECT coalesce(sum(amount), 0) FROM receipt WHERE deposit_no = 1"
+			if deferrable {
+				ro.Do("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE")
+				batch := ro.Do("SELECT deposit_no FROM control").MustBlock()
+				t1.Do("COMMIT").MustOK()
+				batch.MustRows("(2)")
+				ro.Do(total).MustRows("(100)")
+				ro.Do("COMMIT").MustOK()
+				return
+			}
+			ro.Do("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY")
+			ro.Do("SELECT deposit_no FROM control").MustNotBlock().MustRows("(2)")
+			t1.Do("COMMIT").MustOK()
+			L.Note("batch 1 is closed, so its total should be final; a 0 here would be wrong forever")
+			ro.Do(total).MustFail(func(err error) bool {
+				return lab.IsSerialization(err) && hasMessage("read/write dependencies among transactions")(err)
+			})
+			ro.Do("ROLLBACK")
+			L.Note("the retry sees T1's receipt")
+			ro.Do("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY")
+			ro.Do(total).MustRows("(100)")
+			ro.Do("COMMIT").MustOK()
+		})
+	}
 }
 
 // 13.2.3: under SERIALIZABLE, a transaction that checked for a key before inserting it gets a
@@ -625,28 +723,41 @@ func TestLock_AdvisorySemantics(t *testing.T) {
 	t2.Do("COMMIT")
 }
 
-// 13.3.5: a locking function must only run on the rows you mean to lock. In a WHERE clause
-// it runs for every row the scan visits, before ORDER BY ... LIMIT picks one, which is the
-// classic job-queue bug: the locks on the other rows stay until the session ends.
-// (PG 18 evaluates a volatile function in the SELECT list after LIMIT, so the docs' own
-// "danger" query happens to lock only the limited rows here.)
+// 13.3.5: a locking function must only run on the rows you mean to lock. The docs give three
+// queries: "ok", "danger!" (the LIMIT "is not guaranteed to be applied before the locking
+// function is executed") and "ok" (LIMIT in a subquery). They run here verbatim, on a foo
+// with ids 12301..13300.
+//
+// PG 18 does apply the LIMIT first: a volatile function in the SELECT list is evaluated
+// after LIMIT, and after ORDER BY ... LIMIT too, so the "danger!" query locks only its 100
+// rows. The danger is real with the function in WHERE: there it runs for every row the scan
+// visits, before ORDER BY ... LIMIT picks one. That is the classic job-queue bug, and the
+// locks on the other 954 rows stay until the session ends.
 func TestLock_AdvisoryLockFilterPitfall(t *testing.T) {
 	L := newLab(t)
 	L.Exec("DROP TABLE IF EXISTS foo", "CREATE TABLE foo (id int primary key, prio int)",
-		"INSERT INTO foo SELECT g, g FROM generate_series(1, 1000) g", "ANALYZE foo")
+		"INSERT INTO foo SELECT g, g FROM generate_series(12301, 13300) g", "ANALYZE foo")
 	s := L.Session("W")
-	held := func() int {
-		return s.Do("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()").Int()
-	}
-	s.Do("SELECT id FROM foo WHERE id > 100 AND pg_try_advisory_lock(id) ORDER BY prio LIMIT 1").MustRows("(101)")
-	danger := held()
-	s.Do("SELECT pg_advisory_unlock_all()")
-	s.Do("SELECT q.id FROM (SELECT id FROM foo WHERE id > 100 ORDER BY prio LIMIT 1) q WHERE pg_try_advisory_lock(q.id)").MustRows("(101)")
-	safe := held()
-	s.Do("SELECT pg_advisory_unlock_all()")
-	L.Note("advisory locks held: %d with the lock in WHERE, %d with LIMIT applied first in a subquery", danger, safe)
-	if danger != 900 || safe != 1 {
-		t.Fatalf("held %d and %d locks, want 900 and 1", danger, safe)
+	for _, c := range []struct {
+		what, sql string
+		held      int // advisory locks the session holds afterwards
+	}{
+		{"docs: ok", "SELECT pg_advisory_lock(id) FROM foo WHERE id = 12345", 1},
+		{"docs: danger!", "SELECT pg_advisory_lock(id) FROM foo WHERE id > 12345 LIMIT 100", 100},
+		{"docs: ok", "SELECT pg_advisory_lock(q.id) FROM (SELECT id FROM foo WHERE id > 12345 LIMIT 100) q", 100},
+		{"with a sort before the LIMIT", "SELECT pg_advisory_lock(id) FROM foo WHERE id > 12345 ORDER BY prio DESC LIMIT 100", 100},
+		{"lock in WHERE", "SELECT id FROM foo WHERE id > 12345 AND pg_try_advisory_lock(id) ORDER BY prio LIMIT 1", 955},
+		{"lock in WHERE, LIMIT first", "SELECT q.id FROM (SELECT id FROM foo WHERE id > 12345 ORDER BY prio LIMIT 1) q WHERE pg_try_advisory_lock(q.id)", 1},
+	} {
+		L.Quiet() // up to 100 result rows per query
+		s.Do(c.sql).MustOK()
+		held := s.Do("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()").Int()
+		s.Do("SELECT pg_advisory_unlock_all()")
+		L.Loud()
+		L.Note("%-28s  %3d lock(s) held   %s", c.what, held, c.sql)
+		if held != c.held {
+			t.Errorf("%s: %d advisory locks held, want %d: %s", c.what, held, c.held, c.sql)
+		}
 	}
 }
 
@@ -692,6 +803,35 @@ func TestIso_RR_LockTableBeforeSnapshot(t *testing.T) {
 				want = "(100)"
 			}
 			chk.Do("SELECT sum(amount) FROM credits").MustRows(want)
+			chk.Do("COMMIT")
+		})
+	}
+}
+
+// 13.4.2: the docs' bank check: does the sum of credits in one table equal the sum of debits
+// in another, while both are being updated? Two successive SELECT sum(...) "will not work
+// reliably in Read Committed mode, since the second query will likely include the results of
+// transactions not counted by the first". In one REPEATABLE READ transaction both sums come
+// from the same snapshot.
+func TestIso_SumCheckAcrossTwoTables(t *testing.T) {
+	for _, c := range []struct {
+		level  lab.Level
+		debits string
+	}{{lab.ReadCommitted, "(150)"}, {lab.RepeatableRead, "(100)"}} {
+		t.Run(c.level.Short(), func(t *testing.T) {
+			L := newLab(t)
+			L.Exec("DROP TABLE IF EXISTS credits", "DROP TABLE IF EXISTS debits",
+				"CREATE TABLE credits (amount int)", "CREATE TABLE debits (amount int)",
+				"INSERT INTO credits VALUES (100)", "INSERT INTO debits VALUES (100)")
+			chk, wr := L.Session("CHK"), L.Session("WR")
+			chk.Begin(c.level)
+			chk.Do("SELECT sum(amount) FROM credits").MustRows("(100)")
+			wr.Do("BEGIN")
+			wr.Do("INSERT INTO credits VALUES (50)")
+			wr.Do("INSERT INTO debits VALUES (50)")
+			wr.Do("COMMIT")
+			L.Note("the books balance before and after WR's transaction (100 = 100, 150 = 150)")
+			chk.Do("SELECT sum(amount) FROM debits").MustRows(c.debits)
 			chk.Do("COMMIT")
 		})
 	}
@@ -746,19 +886,23 @@ func TestMVCC_TruncateIsNotMVCCSafe(t *testing.T) {
 }
 
 // 13.6: catalog lookups do not use the transaction's snapshot. A table created after a
-// REPEATABLE READ snapshot can be queried (its committed rows stay invisible), while a
-// query on pg_class itself, which does use the snapshot, does not show it.
+// REPEATABLE READ or SERIALIZABLE snapshot can be queried (its committed rows stay
+// invisible), while a query on pg_class itself, which does use the snapshot, does not show it.
 func TestMVCC_CatalogAccessIgnoresSnapshot(t *testing.T) {
-	L := newLab(t)
-	L.Exec("DROP TABLE IF EXISTS newt")
-	rd, dd := L.Session("RD"), L.Session("DDL")
-	rd.Do("BEGIN ISOLATION LEVEL REPEATABLE READ")
-	rd.Do("SELECT 1")
-	dd.Do("CREATE TABLE newt (id int)")
-	dd.Do("INSERT INTO newt VALUES (1)")
-	rd.Do("SELECT count(*) FROM newt").MustRows("(0)")
-	rd.Do("SELECT count(*) FROM pg_class WHERE relname = 'newt'").MustRows("(0)")
-	rd.Do("COMMIT")
+	for _, level := range []lab.Level{lab.RepeatableRead, lab.Serializable} {
+		t.Run(level.Short(), func(t *testing.T) {
+			L := newLab(t)
+			L.Exec("DROP TABLE IF EXISTS newt")
+			rd, dd := L.Session("RD"), L.Session("DDL")
+			rd.Begin(level)
+			rd.Do("SELECT 1")
+			dd.Do("CREATE TABLE newt (id int)")
+			dd.Do("INSERT INTO newt VALUES (1)")
+			rd.Do("SELECT count(*) FROM newt").MustRows("(0)")
+			rd.Do("SELECT count(*) FROM pg_class WHERE relname = 'newt'").MustRows("(0)")
+			rd.Do("COMMIT")
+		})
+	}
 }
 
 // 13.4.1: the docs' advice for relying on SERIALIZABLE: make it the default
@@ -791,18 +935,42 @@ END $$`,
 }
 
 // 13.2.1: a READ COMMITTED query sees the database as of the instant it began. A change
-// committed while the query is still running stays invisible to it. (The query is held up
-// in the middle by an advisory lock; its subquery reads r only after the lock is granted.)
+// committed while the query is still running stays invisible to it. The query is held up in
+// the middle by an advisory lock, and its subquery is correlated with the lock call, so it
+// reads r only after the lock is granted. The control: a VOLATILE function in the same query
+// takes a new snapshot for each statement it runs, and does see the change.
 func TestIso_RC_QueryKeepsItsSnapshotWhileRunning(t *testing.T) {
 	L := newLab(t)
 	setupRows(L)
+	L.Exec("CREATE OR REPLACE FUNCTION r_v1() RETURNS int VOLATILE LANGUAGE sql AS 'SELECT v FROM r WHERE id = 1'")
 	rd, w := L.Session("RD"), L.Session("W")
 	w.Do("SELECT pg_advisory_lock(7)")
-	sel := rd.Do("SELECT pg_advisory_xact_lock(7) IS NULL, (SELECT v FROM r WHERE id = 1)").MustBlock()
+	sel := rd.Do(`SELECT (SELECT v FROM r WHERE id = 1 AND l.x IS NOT NULL) AS query_snapshot, r_v1() AS new_snapshot
+FROM (SELECT pg_advisory_xact_lock(7) AS x OFFSET 0) l`).MustBlock()
 	w.Do("UPDATE r SET v = 1 WHERE id = 1").MustOK()
 	w.Do("SELECT pg_advisory_unlock(7)")
-	sel.MustRows("(false,0)")
+	sel.MustRows("(0,1)")
 	rd.Do("SELECT v FROM r WHERE id = 1").MustRows("(1)")
+}
+
+// 13.2.1: a waiting UPDATE "will only find target rows that were committed as of the command
+// start time". Once unblocked it re-checks the row it waited for, but does not look for new
+// ones: the matching row T1 inserted is left alone. "Subsequent commands in the same
+// transaction will see the effects of the committed concurrent transaction in any case."
+func TestIso_RC_WaitDoesNotFindNewRows(t *testing.T) {
+	L := newLab(t)
+	setupRows(L)
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1.Do("BEGIN")
+	t1.Do("UPDATE r SET v = 1 WHERE id = 1")
+	t1.Do("INSERT INTO r VALUES (3, 1)")
+	t2.Do("BEGIN")
+	upd := t2.Do("UPDATE r SET v = v + 100 WHERE v < 10").MustBlock()
+	t1.Do("COMMIT")
+	upd.MustAffect(2)
+	t2.Do("SELECT id, v FROM r ORDER BY id").MustRows("(1,101) (2,100) (3,1)")
+	t2.Do("UPDATE r SET v = v + 100 WHERE v < 10").MustAffect(1)
+	t2.Do("COMMIT")
 }
 
 // 13.2.1 / 13.3.2: SELECT FOR UPDATE / FOR SHARE that waited for a concurrent writer locks
@@ -938,8 +1106,11 @@ func TestIso_SER_PredicateLockPromotion(t *testing.T) {
 }
 
 // 13.2.3: a READ ONLY serializable transaction that starts while no read-write serializable
-// transaction is active takes no predicate locks at all. A read-write one must keep its
-// SIRead locks past its own COMMIT, until the transactions that overlapped it are done.
+// transaction is active takes no predicate locks at all. One that starts while such a
+// transaction is active takes them, and "may be able to release its SIRead locks before
+// completion": they are gone at its next read after that transaction ended. A read-write one
+// must keep its SIRead locks past its own COMMIT, until the transactions that overlapped it
+// are done.
 func TestIso_SER_PredicateLockLifetime(t *testing.T) {
 	L := newLab(t)
 	setupRows(L)
@@ -951,6 +1122,22 @@ func TestIso_SER_PredicateLockLifetime(t *testing.T) {
 	t1.Do("SELECT * FROM r").MustOK()
 	if n := sireads(); n != "0" {
 		t.Fatalf("READ ONLY transaction with no concurrent writer holds %s SIRead locks, want 0", n)
+	}
+	t1.Do("COMMIT")
+
+	L.Note("a READ ONLY transaction that overlaps a read-write one does take them, and releases\n" +
+		"them before it completes, once that transaction is gone and no conflict can still occur")
+	t2.Do("BEGIN ISOLATION LEVEL SERIALIZABLE")
+	t2.Do("SELECT 1")
+	t1.Do("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY")
+	t1.Do("SELECT * FROM r").MustOK()
+	if sireads() == "0" {
+		t.Fatal("READ ONLY transaction that overlaps a read-write one took no SIRead locks")
+	}
+	t2.Do("COMMIT")
+	t1.Do("SELECT * FROM r").MustOK()
+	if n := sireads(); n != "0" {
+		t.Fatalf("READ ONLY transaction still holds %s SIRead locks after the overlapping transaction ended", n)
 	}
 	t1.Do("COMMIT")
 

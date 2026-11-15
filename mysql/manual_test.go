@@ -31,6 +31,14 @@ func recordLocks(locks []lab.Lock, session string) []string {
 	return out
 }
 
+// innodbDeadlocks reads the number of deadlocks InnoDB has detected since the server started.
+func innodbDeadlocks(L *lab.Lab) int {
+	L.T.Helper()
+	var n int
+	fmt.Sscan(L.QueryString(`SELECT count FROM information_schema.INNODB_METRICS WHERE NAME = "lock_deadlocks"`), &n)
+	return n
+}
+
 func setGlobal(t *testing.T, L *lab.Lab, name, value string) {
 	t.Helper()
 	old := L.QueryString("SELECT @@GLOBAL." + name)
@@ -434,6 +442,71 @@ func TestMVCC_DMLSeesRowsTheSnapshotCannot(t *testing.T) {
 	a.Do("COMMIT")
 }
 
+// 17.7.2.3: in REPEATABLE READ "all consistent reads within the same transaction read the
+// snapshot established by the first such read"; in READ COMMITTED "each consistent read
+// within a transaction sets and reads its own fresh snapshot".
+func TestMVCC_SnapshotPerTransactionOrPerRead(t *testing.T) {
+	for _, c := range []struct {
+		level  lab.Level
+		second string
+	}{{lab.RepeatableRead, "(0)"}, {lab.ReadCommitted, "(1)"}} {
+		t.Run(c.level.Short(), func(t *testing.T) {
+			L := newLab(t)
+			setupT(L)
+			a, b := L.Session("A"), L.Session("B")
+			a.Begin(c.level)
+			a.Do("SELECT v FROM t WHERE id = 10").MustRows("(0)")
+			b.Do("UPDATE t SET v = 1 WHERE id = 10")
+			a.Do("SELECT v FROM t WHERE id = 10").MustRows(c.second)
+			a.Do("COMMIT")
+		})
+	}
+}
+
+// 17.7.2.3: a query also "sees the changes made by earlier statements within the same
+// transaction", and that exception "causes the following anomaly: if you update some rows in
+// a table, a SELECT sees the latest version of the updated rows, but it might also see older
+// versions of any rows ... you might see the table in a state that never existed".
+// B moves 10 from row 10 to row 20; the total is 300 before and after. A, whose snapshot
+// predates B, adds 1 to row 10 and then sees its own new row 10 (B's 90, plus 1) next to
+// the snapshot's old row 20: a total of 291, when 301 is the only value A's +1 can explain.
+func TestMVCC_OwnUpdateMixesNewAndOldVersions(t *testing.T) {
+	L := newLab(t)
+	setupT(L)
+	L.Exec("UPDATE t SET v = 100")
+	a, b := L.Session("A"), L.Session("B")
+	a.Do("START TRANSACTION")
+	a.Do("SELECT sum(v) FROM t").MustRows("(300)")
+	b.Do("START TRANSACTION")
+	b.Do("UPDATE t SET v = v - 10 WHERE id = 10")
+	b.Do("UPDATE t SET v = v + 10 WHERE id = 20")
+	b.Do("COMMIT")
+	a.Do("SELECT sum(v) FROM t").MustRows("(300)")
+	a.Do("UPDATE t SET v = v + 1 WHERE id = 10").MustAffect(1)
+	a.Do("SELECT id, v FROM t ORDER BY id").MustRows("(10,91) (20,100) (30,100)")
+	a.Do("SELECT sum(v) FROM t").MustRows("(291)")
+	a.Do("COMMIT")
+	a.Do("SELECT sum(v) FROM t").MustRows("(301)")
+}
+
+// 17.7.2.3: the SELECT inside INSERT INTO ... SELECT is not a consistent read of the
+// transaction's snapshot. In REPEATABLE READ it "acts like READ COMMITTED, where each
+// consistent read ... sets and reads its own fresh snapshot" (and takes shared locks:
+// TestLock_InsertSelectLocksSource), so it copies a row the transaction itself cannot see.
+func TestMVCC_InsertSelectReadsLatestCommitted(t *testing.T) {
+	L := newLab(t)
+	setupT(L)
+	L.Exec("DROP TABLE IF EXISTS dst", "CREATE TABLE dst (id int PRIMARY KEY)")
+	a, b := L.Session("A"), L.Session("B")
+	a.Do("START TRANSACTION")
+	a.Do("SELECT id FROM t ORDER BY id").MustRows("(10) (20) (30)")
+	b.Do("INSERT INTO t VALUES (40, 40, 0)")
+	a.Do("INSERT INTO dst SELECT id FROM t").MustAffect(4)
+	a.Do("SELECT id FROM t ORDER BY id").MustRows("(10) (20) (30)")
+	a.Do("SELECT id FROM dst ORDER BY id").MustRows("(10) (20) (30) (40)")
+	a.Do("COMMIT")
+}
+
 // 17.7.2.3: the manual's timeline. With autocommit=0, A only sees B's committed row after A
 // itself commits and so takes a new snapshot.
 func TestMVCC_TimepointAdvancesAfterCommitDocsExample(t *testing.T) {
@@ -690,6 +763,9 @@ func TestLock_LockingReadsDocs(t *testing.T) {
 // Tables: t (id PK, k non-unique) = 10/20/30, tu (id PK, u UNIQUE, v) = (1,10) (2,20) (3,30),
 // and fkc (id PK, pid → t.id), empty.
 //
+// update-duplicate-unique is the manual's "UPDATE ... takes shared locks on affected secondary
+// index records when performing duplicate check scans": the failed check leaves S on uu's 30.
+//
 // Where 9.7 sets more than the manual lists, the case says why:
 //   - delete-unique: deleting a parent row checks the FK in the child table; the empty child
 //     index gets a shared lock on its supremum (the manual's "shared record-level locks on
@@ -712,41 +788,43 @@ func TestLock_LocksSetByStatement(t *testing.T) {
 	cases := []struct {
 		name, stmt string
 		level      lab.Level
-		fails      bool
+		fails      string // expected error number; "" = succeeds
 		want       []string
 	}{
-		{"select-RR", "SELECT * FROM t WHERE id BETWEEN 10 AND 20", lab.RepeatableRead, false, nil},
-		{"select-SER-unique", "SELECT * FROM t WHERE id = 20", lab.Serializable, false, []string{"t.PRIMARY S,REC_NOT_GAP 20"}},
-		{"select-SER-range", "SELECT * FROM t WHERE id > 15", lab.Serializable, false,
+		{"select-RR", "SELECT * FROM t WHERE id BETWEEN 10 AND 20", lab.RepeatableRead, "", nil},
+		{"select-SER-unique", "SELECT * FROM t WHERE id = 20", lab.Serializable, "", []string{"t.PRIMARY S,REC_NOT_GAP 20"}},
+		{"select-SER-range", "SELECT * FROM t WHERE id > 15", lab.Serializable, "",
 			[]string{"t.PRIMARY S 20", "t.PRIMARY S 30", "t.PRIMARY S supremum pseudo-record"}},
-		{"update-unique", "UPDATE t SET v = 1 WHERE id = 20", "", false, []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
-		{"update-range", "UPDATE t SET v = 1 WHERE id > 15", "", false,
+		{"update-unique", "UPDATE t SET v = 1 WHERE id = 20", "", "", []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
+		{"update-range", "UPDATE t SET v = 1 WHERE id > 15", "", "",
 			[]string{"t.PRIMARY X 20", "t.PRIMARY X 30", "t.PRIMARY X supremum pseudo-record"}},
-		{"delete-unique", "DELETE FROM t WHERE id = 20", "", false,
+		{"delete-unique", "DELETE FROM t WHERE id = 20", "", "",
 			[]string{"fkc.pid S supremum pseudo-record", "t.PRIMARY X,REC_NOT_GAP 20"}},
-		{"delete-missing", "DELETE FROM t WHERE id = 25", "", false, []string{"t.PRIMARY X,GAP 30"}},
-		{"insert", "INSERT INTO t VALUES (25, 25, 0)", "", false, nil},
-		{"insert-duplicate-pk", "INSERT INTO t VALUES (20, 0, 0)", "", true, []string{"t.PRIMARY S,REC_NOT_GAP 20"}},
-		{"insert-duplicate-unique", "INSERT INTO tu (id, u) VALUES (9, 20)", "", true,
+		{"delete-missing", "DELETE FROM t WHERE id = 25", "", "", []string{"t.PRIMARY X,GAP 30"}},
+		{"insert", "INSERT INTO t VALUES (25, 25, 0)", "", "", nil},
+		{"insert-duplicate-pk", "INSERT INTO t VALUES (20, 0, 0)", "", "1062", []string{"t.PRIMARY S,REC_NOT_GAP 20"}},
+		{"insert-duplicate-unique", "INSERT INTO tu (id, u) VALUES (9, 20)", "", "1062",
 			[]string{"tu.PRIMARY X supremum pseudo-record", "tu.uu S 20, 2"}},
-		{"odku-duplicate-pk", "INSERT INTO t VALUES (20, 0, 0) ON DUPLICATE KEY UPDATE v = 9", "", false, []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
-		{"odku-duplicate-unique", "INSERT INTO tu (id, u) VALUES (9, 20) ON DUPLICATE KEY UPDATE v = 9", "", false,
+		{"odku-duplicate-pk", "INSERT INTO t VALUES (20, 0, 0) ON DUPLICATE KEY UPDATE v = 9", "", "", []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
+		{"odku-duplicate-unique", "INSERT INTO tu (id, u) VALUES (9, 20) ON DUPLICATE KEY UPDATE v = 9", "", "",
 			[]string{"tu.PRIMARY X supremum pseudo-record", "tu.PRIMARY X,REC_NOT_GAP 2", "tu.uu X 20, 2"}},
-		{"replace-new", "REPLACE INTO t VALUES (25, 25, 0)", "", false, nil},
-		{"replace-collision", "REPLACE INTO t VALUES (20, 0, 0)", "", false, []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
-		{"fk-check", "INSERT INTO fkc VALUES (1, 20)", "", false, []string{"t.PRIMARY S,REC_NOT_GAP 20"}},
-		{"fk-check-fails", "INSERT INTO fkc VALUES (1, 25)", "", true, []string{"t.PRIMARY S,GAP 30"}},
-		{"fk-check-fails-RC", "INSERT INTO fkc VALUES (1, 25)", lab.ReadCommitted, true, nil},
-		{"delete-unique-RC", "DELETE FROM t WHERE id = 20", lab.ReadCommitted, false, []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
-		{"update-range-RC", "UPDATE t SET v = 1 WHERE id > 15", lab.ReadCommitted, false,
+		{"update-duplicate-unique", "UPDATE tu SET u = 30 WHERE id = 2", "", "1062",
+			[]string{"tu.PRIMARY X,REC_NOT_GAP 2", "tu.uu S 30, 3"}},
+		{"replace-new", "REPLACE INTO t VALUES (25, 25, 0)", "", "", nil},
+		{"replace-collision", "REPLACE INTO t VALUES (20, 0, 0)", "", "", []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
+		{"fk-check", "INSERT INTO fkc VALUES (1, 20)", "", "", []string{"t.PRIMARY S,REC_NOT_GAP 20"}},
+		{"fk-check-fails", "INSERT INTO fkc VALUES (1, 25)", "", "1452", []string{"t.PRIMARY S,GAP 30"}},
+		{"fk-check-fails-RC", "INSERT INTO fkc VALUES (1, 25)", lab.ReadCommitted, "1452", nil},
+		{"delete-unique-RC", "DELETE FROM t WHERE id = 20", lab.ReadCommitted, "", []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
+		{"update-range-RC", "UPDATE t SET v = 1 WHERE id > 15", lab.ReadCommitted, "",
 			[]string{"t.PRIMARY X,REC_NOT_GAP 20", "t.PRIMARY X,REC_NOT_GAP 30"}},
-		{"for-update-const-nonmatching", "SELECT * FROM t WHERE id = 20 AND v = 99 FOR UPDATE", "", false, []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
-		{"for-update-const-nonmatching-RC", "SELECT * FROM t WHERE id = 20 AND v = 99 FOR UPDATE", lab.ReadCommitted, false, []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
-		{"for-update-range-nonmatching", "SELECT * FROM t WHERE id >= 20 AND v = 99 FOR UPDATE", "", false,
+		{"for-update-const-nonmatching", "SELECT * FROM t WHERE id = 20 AND v = 99 FOR UPDATE", "", "", []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
+		{"for-update-const-nonmatching-RC", "SELECT * FROM t WHERE id = 20 AND v = 99 FOR UPDATE", lab.ReadCommitted, "", []string{"t.PRIMARY X,REC_NOT_GAP 20"}},
+		{"for-update-range-nonmatching", "SELECT * FROM t WHERE id >= 20 AND v = 99 FOR UPDATE", "", "",
 			[]string{"t.PRIMARY X 30", "t.PRIMARY X supremum pseudo-record", "t.PRIMARY X,REC_NOT_GAP 20"}},
-		{"for-update-range-nonmatching-RC", "SELECT * FROM t WHERE id >= 20 AND v = 99 FOR UPDATE", lab.ReadCommitted, false, nil},
-		{"for-update-union-nonmatching-RC", "(SELECT * FROM t WHERE id >= 20 AND v = 99 FOR UPDATE) UNION (SELECT * FROM t WHERE id <= 10 AND v = 99 FOR UPDATE)", lab.ReadCommitted, false, nil},
-		{"replace-collision-unique", "REPLACE INTO tu VALUES (9, 20, 0)", "", false,
+		{"for-update-range-nonmatching-RC", "SELECT * FROM t WHERE id >= 20 AND v = 99 FOR UPDATE", lab.ReadCommitted, "", nil},
+		{"for-update-union-nonmatching-RC", "(SELECT * FROM t WHERE id >= 20 AND v = 99 FOR UPDATE) UNION (SELECT * FROM t WHERE id <= 10 AND v = 99 FOR UPDATE)", lab.ReadCommitted, "", nil},
+		{"replace-collision-unique", "REPLACE INTO tu VALUES (9, 20, 0)", "", "",
 			[]string{"tu.PRIMARY X supremum pseudo-record", "tu.PRIMARY X,GAP 9", "tu.PRIMARY X,REC_NOT_GAP 2",
 				"tu.uu X 20, 2", "tu.uu X 30, 3", "tu.uu X,GAP 20, 9"}},
 	}
@@ -764,8 +842,8 @@ func TestLock_LocksSetByStatement(t *testing.T) {
 				level = lab.RepeatableRead
 			}
 			s.Begin(level)
-			if op := s.Do(c.stmt); c.fails {
-				op.MustFail(nil)
+			if op := s.Do(c.stmt); c.fails != "" {
+				op.MustFail(func(err error) bool { return lab.Code(err) == c.fails })
 			} else {
 				op.MustOK()
 			}
@@ -795,12 +873,7 @@ func TestDeadlock_ManualAnimalsBirds(t *testing.T) {
 		"CREATE TABLE Birds (name VARCHAR(10) PRIMARY KEY, value INT) ENGINE = InnoDB",
 		`INSERT INTO Animals (name,value) VALUES ("Aardvark",10)`,
 		`INSERT INTO Birds (name,value) VALUES ("Buzzard",20)`)
-	deadlocks := func() int {
-		var n int
-		fmt.Sscan(L.QueryString(`SELECT count FROM information_schema.INNODB_METRICS WHERE NAME = "lock_deadlocks"`), &n)
-		return n
-	}
-	before := deadlocks()
+	before := innodbDeadlocks(L)
 	start := L.QueryString("SELECT NOW(6)")
 
 	a, b := L.Session("A"), L.Session("B")
@@ -856,7 +929,7 @@ JOIN performance_schema.threads b ON b.THREAD_ID = w.BLOCKING_THREAD_ID`)
 	upd.MustAffect(1)
 	b.Do("COMMIT")
 
-	if got := deadlocks() - before; got != 1 {
+	if got := innodbDeadlocks(L) - before; got != 1 {
 		t.Fatalf("lock_deadlocks went up by %d, want 1", got)
 	}
 	logged := L.QueryString("SELECT count(*) FROM performance_schema.error_log WHERE LOGGED >= ? AND DATA LIKE '%deadlock%'", start)
@@ -1478,10 +1551,7 @@ func TestDeadlock_UndetectedAcrossStorageEngines(t *testing.T) {
 	L := newLab(t)
 	setupT(L)
 	L.Exec("DROP TABLE IF EXISTS my", "CREATE TABLE my (id int) ENGINE = MyISAM", "INSERT INTO my VALUES (10)")
-	deadlocks := func() string {
-		return L.QueryString(`SELECT count FROM information_schema.INNODB_METRICS WHERE NAME = "lock_deadlocks"`)
-	}
-	before := deadlocks()
+	before := innodbDeadlocks(L)
 	t1, t2 := L.Session("T1"), L.Session("T2")
 	t2.Do("SET SESSION innodb_lock_wait_timeout = 2")
 	t1.Do("START TRANSACTION")
@@ -1492,8 +1562,8 @@ func TestDeadlock_UndetectedAcrossStorageEngines(t *testing.T) {
 	sel.MustFail(func(err error) bool { return lab.Code(err) == "1205" })
 	rd.MustRows("(10)")
 	t1.Do("ROLLBACK")
-	if after := deadlocks(); after != before {
-		t.Fatalf("lock_deadlocks went from %s to %s: InnoDB should not have seen this cycle", before, after)
+	if after := innodbDeadlocks(L); after != before {
+		t.Fatalf("lock_deadlocks went from %d to %d: InnoDB should not have seen this cycle", before, after)
 	}
 }
 
@@ -1560,10 +1630,7 @@ func TestDeadlock_LockTablesDetectedByMetadataLocks(t *testing.T) {
 			L := newLab(t)
 			setupT(L)
 			L.Exec("DROP TABLE IF EXISTS aa", "CREATE TABLE aa (id int PRIMARY KEY, v int)", "INSERT INTO aa VALUES (1, 0)")
-			deadlocks := func() string {
-				return L.QueryString(`SELECT count FROM information_schema.INNODB_METRICS WHERE NAME = "lock_deadlocks"`)
-			}
-			before := deadlocks()
+			before := innodbDeadlocks(L)
 			t1, t2 := L.Session("T1"), L.Session("T2")
 			t2.Do("SET autocommit = " + autocommit)
 			t1.Do("START TRANSACTION")
@@ -1583,8 +1650,8 @@ func TestDeadlock_LockTablesDetectedByMetadataLocks(t *testing.T) {
 			L.Note("T1 was rolled back as a whole: its UPDATE of t is gone")
 			t2.Do("SELECT v FROM t WHERE id = 10").MustRows("(0)")
 			t2.Do("UNLOCK TABLES")
-			if after := deadlocks(); after != before {
-				t.Fatalf("lock_deadlocks went from %s to %s: this deadlock is not InnoDB's to detect", before, after)
+			if after := innodbDeadlocks(L); after != before {
+				t.Fatalf("lock_deadlocks went from %d to %d: this deadlock is not InnoDB's to detect", before, after)
 			}
 		})
 	}

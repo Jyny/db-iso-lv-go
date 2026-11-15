@@ -582,6 +582,11 @@ func (op *Op) MustFail(match func(error) bool) *Op {
 	if op.Err == nil {
 		t.Fatalf("#%d %s: %q expected to fail, but succeeded%s", op.Seq, op.S.Name, op.SQL, op.resultSuffix())
 	}
+	// A skipped op only carries the error that aborted its transaction; it never ran.
+	if op.Skipped {
+		t.Fatalf("#%d %s: %q expected to fail, but it was not run: the transaction was already aborted by %s",
+			op.Seq, op.S.Name, op.SQL, Describe(op.Err))
+	}
 	if match != nil && !match(op.Err) {
 		t.Fatalf("#%d %s: %q unexpected error: %s", op.Seq, op.S.Name, op.SQL, Describe(op.Err))
 	}

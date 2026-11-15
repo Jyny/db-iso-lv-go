@@ -64,7 +64,8 @@ var postgresDocs = []docBlock{
 		{1, "select * from test", "=(1,11) (2,21)", ""},
 		{2, "update test set value = 22 where id = 2", "", ""},
 		{2, "commit", "", ""},
-		{1, "select * from test", "=(1,12) (2,22)", ""},
+		{1, "select * from test", "=(1,12) (2,22)", ""}, // "either"
+		{2, "select * from test", "=(1,12) (2,22)", ""},
 	}},
 	{"G1a", "read committed", both, []docStep{
 		{1, "update test set value = 101 where id = 1", "", ""},
@@ -204,7 +205,8 @@ var postgresDocs = []docBlock{
 		{2, "insert into test (id, value) values(4, 42)", "", ""},
 		{1, "commit", "", ""},
 		{2, "commit", "", ""},
-		{1, "select * from test where value % 3 = 0", "=(3,30) (4,42)", ""},
+		{1, "select * from test where value % 3 = 0", "=(3,30) (4,42)", ""}, // "Either"
+		{2, "select * from test where value % 3 = 0", "=(3,30) (4,42)", ""},
 	}},
 	{"G2", "serializable", both, []docStep{
 		{1, "select * from test where value % 3 = 0", "", ""},
@@ -527,6 +529,9 @@ func TestHermitageDocs(t *testing.T) {
 						} else {
 							sess[i].Do("begin")
 							sess[i].Do("set transaction isolation level " + b.level)
+							// The level the document's "select current_setting('transaction_isolation')"
+							// would show. SHOW takes no snapshot, so the first statement still does.
+							sess[i].Do("show transaction_isolation").MustRows("(" + b.level + ")")
 						}
 					}
 					for _, i := range b.begin {

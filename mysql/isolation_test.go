@@ -94,21 +94,30 @@ func TestIso_RR_WriteSkewAndForUpdateFix(t *testing.T) {
 	}
 }
 
-// SERIALIZABLE only turns plain SELECTs into locking reads inside explicit transactions.
-// With autocommit=1 each SELECT is its own transaction and stays a non-locking snapshot read.
+// 17.7.2.1 SERIALIZABLE: InnoDB "implicitly converts all plain SELECT statements to
+// SELECT ... FOR SHARE if autocommit is disabled. If autocommit is enabled, the SELECT is its
+// own transaction" and stays a non-locking consistent read. "To force a plain SELECT to block
+// if other transactions have modified the selected rows, disable autocommit." An explicit
+// START TRANSACTION (autocommit still 1) converts it too.
 func TestIso_SER_AutocommitSelectStaysNonLocking(t *testing.T) {
 	L := newLab(t)
 	setupT(L)
 	t1, t2 := L.Session("T1"), L.Session("T2")
-	t1.Do("START TRANSACTION")
-	t1.Do("UPDATE t SET v = 99 WHERE id = 10")
 	t2.Do("SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-	t2.Do("SELECT v FROM t WHERE id = 10").MustNotBlock().MustRows("(0)")
-	t2.Do("START TRANSACTION")
-	sel := t2.Do("SELECT v FROM t WHERE id = 10").MustBlock()
-	t1.Do("COMMIT")
-	sel.MustRows("(99)")
-	t2.Do("COMMIT")
+	for _, begin := range []string{"SET autocommit = 0", "START TRANSACTION"} {
+		L.Exec("UPDATE t SET v = 0 WHERE id = 10")
+		t1.Do("START TRANSACTION")
+		t1.Do("UPDATE t SET v = 99 WHERE id = 10")
+		t2.Do("SELECT v FROM t WHERE id = 10").MustNotBlock().MustRows("(0)")
+		L.Note("%s: the same SELECT becomes a locking read", begin)
+		t2.Do(begin)
+		sel := t2.Do("SELECT v FROM t WHERE id = 10").MustBlock()
+		mustHaveLock(t, L.ShowLocks(), "T2", "S,REC_NOT_GAP", "10")
+		t1.Do("COMMIT")
+		sel.MustRows("(99)")
+		t2.Do("COMMIT")
+		t2.Do("SET autocommit = 1")
+	}
 }
 
 // READ UNCOMMITTED reads the newest version in the clustered index, uncommitted or not.

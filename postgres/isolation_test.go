@@ -165,6 +165,11 @@ SELECT a.application_name, l.locktype, l.relation::regclass, l.page, l.tuple
 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
 WHERE l.mode = 'SIReadLock' AND a.application_name LIKE 'lab:%' AND l.locktype = 'relation'
 ORDER BY 1, 2, 3`)
+			// 13.2.3: "A sequential scan will always necessitate a relation-level predicate lock."
+			heapLocks := L.QueryString("SELECT count(*) FROM pg_locks WHERE mode = 'SIReadLock' AND locktype = 'relation' AND relation = 'ledger'::regclass")
+			if want := map[bool]string{false: "2", true: "0"}[useIndex]; heapLocks != want {
+				t.Fatalf("relation-level SIRead locks on ledger: %s, want %s", heapLocks, want)
+			}
 			t1.Do("INSERT INTO ledger (grp, amount) VALUES (1, 10)")
 			t2.Do("INSERT INTO ledger (grp, amount) VALUES (3, 10)")
 			t1.Do("COMMIT").MustOK()
