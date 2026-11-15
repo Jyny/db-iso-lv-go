@@ -29,6 +29,9 @@ import (
 //	"!text"    fails with an error containing text
 //	"block"    BLOCKS; then says how it ends once unblocked ("" = succeeds, or "=…" / "!text")
 //	"-"        not checked (COMMIT / ROLLBACK of a transaction the DB may already have aborted)
+//
+// want may end in "|frees 2" (or "|frees 2,3"): the document says this statement unblocks
+// T2's (and T3's) BLOCKED statement. A blocked statement must stay blocked until then.
 type docStep struct {
 	s          int
 	sql        string
@@ -57,7 +60,7 @@ var postgresDocs = []docBlock{
 		{1, "update test set value = 11 where id = 1", "", ""},
 		{2, "update test set value = 12 where id = 1", "block", ""},
 		{1, "update test set value = 21 where id = 2", "", ""},
-		{1, "commit", "", ""},
+		{1, "commit", "|frees 2", ""},
 		{1, "select * from test", "=(1,11) (2,21)", ""},
 		{2, "update test set value = 22 where id = 2", "", ""},
 		{2, "commit", "", ""},
@@ -90,7 +93,7 @@ var postgresDocs = []docBlock{
 		{1, "update test set value = 11 where id = 1", "", ""},
 		{1, "update test set value = 19 where id = 2", "", ""},
 		{2, "update test set value = 12 where id = 1", "block", ""},
-		{1, "commit", "", ""},
+		{1, "commit", "|frees 2", ""},
 		{3, "select * from test where id = 1", "=(1,11)", ""},
 		{2, "update test set value = 18 where id = 2", "", ""},
 		{3, "select * from test where id = 2", "=(2,19)", ""},
@@ -116,14 +119,14 @@ var postgresDocs = []docBlock{
 	{"PMP-write", "read committed", both, []docStep{
 		{1, "update test set value = value + 10", "", ""},
 		{2, "delete from test where value = 20", "block", ""},
-		{1, "commit", "", ""},
+		{1, "commit", "|frees 2", ""},
 		{2, "select * from test where value = 20", "=(1,20)", ""},
 		{2, "commit", "", ""},
 	}},
 	{"PMP-write", "repeatable read", both, []docStep{
 		{1, "update test set value = value + 10", "", ""},
 		{2, "delete from test where value = 20", "block", docPGUpdate},
-		{1, "commit", "", ""},
+		{1, "commit", "|frees 2", ""},
 		{2, "abort", "-", ""},
 	}},
 	{"P4", "read committed", both, []docStep{
@@ -131,7 +134,7 @@ var postgresDocs = []docBlock{
 		{2, "select * from test where id = 1", "=(1,10)", ""},
 		{1, "update test set value = 11 where id = 1", "", ""},
 		{2, "update test set value = 11 where id = 1", "block", ""},
-		{1, "commit", "", ""},
+		{1, "commit", "|frees 2", ""},
 		{2, "commit", "", ""},
 	}},
 	{"P4", "repeatable read", both, []docStep{
@@ -139,7 +142,7 @@ var postgresDocs = []docBlock{
 		{2, "select * from test where id = 1", "=(1,10)", ""},
 		{1, "update test set value = 11 where id = 1", "", ""},
 		{2, "update test set value = 11 where id = 1", "block", docPGUpdate},
-		{1, "commit", "", ""},
+		{1, "commit", "|frees 2", ""},
 		{2, "abort", "-", ""},
 	}},
 	{"G-single", "read committed", both, []docStep{
@@ -230,7 +233,7 @@ var mysqlDocs = []docBlock{
 		{1, "update test set value = 11 where id = 1", "", ""},
 		{2, "update test set value = 12 where id = 1", "block", ""},
 		{1, "update test set value = 21 where id = 2", "", ""},
-		{1, "commit", "", ""},
+		{1, "commit", "|frees 2", ""},
 		{1, "select * from test", "=(1,12) (2,21)", ""},
 		{2, "update test set value = 22 where id = 2", "", ""},
 		{2, "commit", "", ""},
@@ -286,7 +289,7 @@ var mysqlDocs = []docBlock{
 		{1, "update test set value = 11 where id = 1", "", ""},
 		{1, "update test set value = 19 where id = 2", "", ""},
 		{2, "update test set value = 12 where id = 1", "block", ""},
-		{1, "commit", "", ""},
+		{1, "commit", "|frees 2", ""},
 		{3, "select * from test", "=(1,12) (2,19)", ""},
 		{2, "update test set value = 18 where id = 2", "", ""},
 		{3, "select * from test", "=(1,12) (2,18)", ""},
@@ -297,7 +300,7 @@ var mysqlDocs = []docBlock{
 		{1, "update test set value = 11 where id = 1", "", ""},
 		{1, "update test set value = 19 where id = 2", "", ""},
 		{2, "update test set value = 12 where id = 1", "block", ""},
-		{1, "commit", "", ""},
+		{1, "commit", "|frees 2", ""},
 		{3, "select * from test", "=(1,11) (2,19)", ""},
 		{2, "update test set value = 18 where id = 2", "", ""},
 		{3, "select * from test", "=(1,11) (2,19)", ""},
@@ -323,7 +326,7 @@ var mysqlDocs = []docBlock{
 		{1, "update test set value = value + 10", "", ""},
 		{2, "select * from test", "=(1,10) (2,20)", ""},
 		{2, "delete from test where value = 20", "block", ""},
-		{1, "commit", "", ""},
+		{1, "commit", "|frees 2", ""},
 		{2, "select * from test", "=(2,30)", ""},
 		{2, "commit", "", ""},
 	}},
@@ -331,14 +334,14 @@ var mysqlDocs = []docBlock{
 		{1, "update test set value = value + 10", "", ""},
 		{2, "select * from test where value = 20", "=(2,20)", ""},
 		{2, "delete from test where value = 20", "block", ""},
-		{1, "commit", "", ""},
+		{1, "commit", "|frees 2", ""},
 		{2, "select * from test", "=(2,20)", ""},
 		{2, "commit", "", ""},
 	}},
 	{"PMP-write", "serializable", both, []docStep{
 		{2, "select * from test where value = 20", "=(2,20)", ""},
 		{1, "update test set value = value + 10", "block", docDeadlock},
-		{2, "delete from test where value = 20", "", ""},
+		{2, "delete from test where value = 20", "|frees 1", ""},
 		{1, "rollback", "-", ""},
 		{2, "commit", "", ""},
 	}},
@@ -347,14 +350,14 @@ var mysqlDocs = []docBlock{
 		{2, "select * from test where id = 1", "=(1,10)", ""},
 		{1, "update test set value = 11 where id = 1", "", ""},
 		{2, "update test set value = 11 where id = 1", "block", ""},
-		{1, "commit", "", ""},
+		{1, "commit", "|frees 2", ""},
 		{2, "commit", "", ""},
 	}},
 	{"P4", "serializable", both, []docStep{
 		{1, "select * from test where id = 1", "=(1,10)", ""},
 		{2, "select * from test where id = 1", "=(1,10)", ""},
 		{1, "update test set value = 11 where id = 1", "block", ""},
-		{2, "update test set value = 11 where id = 1", docDeadlock, ""},
+		{2, "update test set value = 11 where id = 1", docDeadlock + "|frees 1", ""},
 		{1, "commit", "", ""},
 		{2, "rollback", "-", ""},
 	}},
@@ -399,7 +402,7 @@ var mysqlDocs = []docBlock{
 		{1, "select * from test where id = 1", "=(1,10)", ""},
 		{2, "select * from test", "", ""},
 		{2, "update test set value = 12 where id = 1", "block", ""},
-		{1, "delete from test where value = 20", docDeadlock, ""},
+		{1, "delete from test where value = 20", docDeadlock + "|frees 2", ""},
 		{2, "update test set value = 18 where id = 2", "", ""},
 		{1, "rollback", "-", ""},
 		{2, "commit", "", ""},
@@ -416,7 +419,7 @@ var mysqlDocs = []docBlock{
 		{1, "select * from test where id in (1,2)", "", ""},
 		{2, "select * from test where id in (1,2)", "", ""},
 		{1, "update test set value = 11 where id = 1", "block", ""},
-		{2, "update test set value = 21 where id = 2", docDeadlock, ""},
+		{2, "update test set value = 21 where id = 2", docDeadlock + "|frees 1", ""},
 		{1, "commit", "", ""},
 		{2, "rollback", "-", ""},
 	}},
@@ -433,7 +436,7 @@ var mysqlDocs = []docBlock{
 		{1, "select * from test where value % 3 = 0", "", ""},
 		{2, "select * from test where value % 3 = 0", "", ""},
 		{1, "insert into test (id, value) values(3, 30)", "block", ""},
-		{2, "insert into test (id, value) values(4, 42)", docDeadlock, ""},
+		{2, "insert into test (id, value) values(4, 42)", docDeadlock + "|frees 1", ""},
 		{1, "commit", "", ""},
 		{2, "rollback", "-", ""},
 	}},
@@ -444,8 +447,8 @@ var mysqlDocs = []docBlock{
 		{2, "update test set value = value + 5 where id = 2", "block", docDeadlock},
 		{3, "begin", "", ""},
 		{3, "select * from test", "block", "=(1,10) (2,20)"},
-		{1, "update test set value = 0 where id = 1", "block", ""},
-		{3, "commit", "-", ""},
+		{1, "update test set value = 0 where id = 1", "block|frees 2,3", ""},
+		{3, "commit", "|frees 1", ""},
 		{1, "commit", "", ""},
 		{2, "rollback", "-", ""},
 	}},
@@ -458,6 +461,12 @@ var docNow = map[string]map[int][2]string{
 	"mysql/PMP-write_serializable": {1: {"#1",
 		"no deadlock: T2 already holds S locks on the rows, and its DELETE upgrades them to X without\n" +
 			"queueing behind T1's waiting request. T1 waits, then updates the one row T2 left (serial order T2 → T1)"}},
+}
+
+// docNowFrees: the same, for which blocked statements a step unblocks.
+var docNowFrees = map[string]map[int]string{
+	// T1 is no deadlock victim, so T2's DELETE unblocks nothing; T2's COMMIT does.
+	"mysql/PMP-write_serializable": {2: "", 4: "1"},
 }
 
 // sameRows compares a FormatRows result with a documented one, ignoring row order
@@ -524,12 +533,16 @@ func TestHermitageDocs(t *testing.T) {
 						begin(i)
 					}
 					type pending struct {
-						op   *lab.Op
-						then string
+						op    *lab.Op
+						then  string
+						freed bool
 					}
-					var blocked []pending
-					now := docNow[db.kind.String()+"/"+t.Name()[strings.LastIndex(t.Name(), "/")+1:]]
+					var blocked []*pending
+					key := db.kind.String() + "/" + t.Name()[strings.LastIndex(t.Name(), "/")+1:]
+					now, nowFrees := docNow[key], docNowFrees[key]
 					for i, st := range b.steps {
+						var frees string
+						st.want, frees, _ = strings.Cut(st.want, "|frees ")
 						if o, ok := now[i]; ok {
 							doc := st.want
 							if st.want == "block" {
@@ -539,22 +552,40 @@ func TestHermitageDocs(t *testing.T) {
 							}
 							L.Note("the document says %q for the next statement; now: %s", strings.TrimLeft(doc, "!=#"), o[1])
 						}
+						if f, ok := nowFrees[i]; ok {
+							frees = f
+						}
 						if st.sql == "begin" {
 							begin(st.s)
 							continue
 						}
 						op := sess[st.s].Do(st.sql)
+						// Statements that were BLOCKED before this one: finished now exactly if
+						// the document says this statement unblocks them.
+						for _, p := range blocked {
+							if p.freed {
+								continue
+							}
+							unblocks := slices.Contains(strings.Split(frees, ","), strings.TrimPrefix(p.op.S.Name, "T"))
+							switch done := p.op.Done(); {
+							case done && !unblocks:
+								t.Errorf("#%d %s: %q unblocked #%d %s, the document does not say so", op.Seq, op.S.Name, op.SQL, p.op.Seq, p.op.S.Name)
+							case !done && unblocks:
+								t.Errorf("#%d %s: %q did not unblock #%d %s, the document says it does", op.Seq, op.S.Name, op.SQL, p.op.Seq, p.op.S.Name)
+							}
+							p.freed = p.freed || unblocks || p.op.Done()
+						}
 						switch st.want {
 						case "-":
 						case "block":
 							if !op.Blocked {
 								t.Errorf("#%d %s: %q did not block, the document says it BLOCKS", op.Seq, op.S.Name, op.SQL)
 							}
-							blocked = append(blocked, pending{op, st.then})
+							blocked = append(blocked, &pending{op: op, then: st.then})
 						default:
 							if op.Blocked {
 								t.Errorf("#%d %s: %q blocked, the document does not say so", op.Seq, op.S.Name, op.SQL)
-								blocked = append(blocked, pending{op, st.want})
+								blocked = append(blocked, &pending{op: op, then: st.want})
 								continue
 							}
 							outcome(t, op, st.want)

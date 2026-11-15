@@ -701,6 +701,10 @@ func TestLock_LockingReadsDocs(t *testing.T) {
 //     fail the WHERE clause. That happens only in READ COMMITTED, and not for a row found by a
 //     constant primary-key lookup; REPEATABLE READ keeps every lock. The UNION exception
 //     (rows stay locked) does not show up for this simple UNION.
+//   - replace-collision: the manual says "an exclusive next-key lock is placed on the row to be
+//     replaced". For a primary-key collision it is a record lock without the gap
+//     (X,REC_NOT_GAP); a collision on a unique secondary index does take next-key locks
+//     (replace-collision-unique).
 //   - insert-duplicate-unique: the clustered record for id 9 is inserted before the duplicate
 //     in uu is found. Rolling it back leaves its gap locked (lock inheritance): X on the
 //     PRIMARY supremum. odku-duplicate-unique leaves the same inherited lock.
@@ -1541,31 +1545,47 @@ func TestLock_CATSEqualWeightIsFIFO(t *testing.T) {
 	}
 }
 
-// 17.7.5.2 / 17.7.5.3: the manual says InnoDB cannot detect a deadlock that involves a
-// LOCK TABLES table lock, so only a timeout resolves it. InnoDB indeed does not see this
-// one (lock_deadlocks stays put), but on 9.7 LOCK TABLES waits on metadata locks, and the
-// metadata lock subsystem has a deadlock detector of its own: T1 fails at once with the
-// same ERROR 1213 and is rolled back.
+// 17.7.3 / 17.7.5.2 / 17.7.5.3: deadlocks that involve a LOCK TABLES table lock. The manual:
+// InnoDB is aware of such table locks only with innodb_table_locks = 1 and autocommit = 0;
+// "otherwise" it cannot detect the deadlock, and "with MySQL table-level locks, the timeout
+// method must be used". On 9.7 this cycle never reaches InnoDB in either mode
+// (lock_deadlocks stays put, no InnoDB table lock is involved): LOCK TABLES waits on the
+// metadata lock that T1's open transaction holds, and the metadata lock subsystem has a
+// deadlock detector of its own. T1 fails at once with the same ERROR 1213 and is rolled
+// back; nothing waits for a timeout.
 // (LOCK TABLES takes its metadata locks in name order: it holds aa while it waits for t.)
 func TestDeadlock_LockTablesDetectedByMetadataLocks(t *testing.T) {
-	L := newLab(t)
-	setupT(L)
-	L.Exec("DROP TABLE IF EXISTS aa", "CREATE TABLE aa (id int PRIMARY KEY, v int)", "INSERT INTO aa VALUES (1, 0)")
-	deadlocks := func() string {
-		return L.QueryString(`SELECT count FROM information_schema.INNODB_METRICS WHERE NAME = "lock_deadlocks"`)
-	}
-	before := deadlocks()
-	t1, t2 := L.Session("T1"), L.Session("T2")
-	t2.Do("SET autocommit = 0")
-	t1.Do("START TRANSACTION")
-	t1.Do("UPDATE t SET v = 1 WHERE id = 10")
-	lock := t2.Do("LOCK TABLES aa WRITE, t WRITE").MustBlock()
-	L.ShowMetadataLocks()
-	t1.Do("UPDATE aa SET v = 1 WHERE id = 1").MustFail(lab.IsDeadlock)
-	lock.MustOK()
-	t2.Do("SELECT v FROM t WHERE id = 10").MustRows("(0)")
-	t2.Do("UNLOCK TABLES")
-	if after := deadlocks(); after != before {
-		t.Fatalf("lock_deadlocks went from %s to %s: this deadlock is not InnoDB's to detect", before, after)
+	for _, autocommit := range []string{"0", "1"} {
+		t.Run("autocommit="+autocommit, func(t *testing.T) {
+			L := newLab(t)
+			setupT(L)
+			L.Exec("DROP TABLE IF EXISTS aa", "CREATE TABLE aa (id int PRIMARY KEY, v int)", "INSERT INTO aa VALUES (1, 0)")
+			deadlocks := func() string {
+				return L.QueryString(`SELECT count FROM information_schema.INNODB_METRICS WHERE NAME = "lock_deadlocks"`)
+			}
+			before := deadlocks()
+			t1, t2 := L.Session("T1"), L.Session("T2")
+			t2.Do("SET autocommit = " + autocommit)
+			t1.Do("START TRANSACTION")
+			t1.Do("UPDATE t SET v = 1 WHERE id = 10")
+			lock := t2.Do("LOCK TABLES aa WRITE, t WRITE").MustBlock()
+			L.ShowMetadataLocks()
+			if state := L.QueryString("SELECT STATE FROM performance_schema.processlist WHERE ID = ?", t2.ID); state != "Waiting for table metadata lock" {
+				t.Fatalf("LOCK TABLES waits in state %q, want the metadata lock", state)
+			}
+			start := time.Now()
+			dl := t1.Do("UPDATE aa SET v = 1 WHERE id = 1").MustFail(lab.IsDeadlock)
+			if waited := time.Since(start); waited > 2*time.Second {
+				t.Fatalf("the deadlock error took %v: that is a timeout, not detection", waited)
+			}
+			L.Note("%s", lab.Describe(dl.Err))
+			lock.MustOK()
+			L.Note("T1 was rolled back as a whole: its UPDATE of t is gone")
+			t2.Do("SELECT v FROM t WHERE id = 10").MustRows("(0)")
+			t2.Do("UNLOCK TABLES")
+			if after := deadlocks(); after != before {
+				t.Fatalf("lock_deadlocks went from %s to %s: this deadlock is not InnoDB's to detect", before, after)
+			}
+		})
 	}
 }

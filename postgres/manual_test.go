@@ -1091,3 +1091,62 @@ func TestLock_SharedRowLocksBlockWriters(t *testing.T) {
 		})
 	}
 }
+
+// 13.5: "In cases involving a conflicting prepared transaction, it may not be possible to
+// make progress until the prepared transaction commits or rolls back." A prepared
+// transaction belongs to no session, yet keeps its row locks and its place in SSI's
+// dependency graph: a retry of the transaction that conflicts with it fails every time, and
+// a plain writer of the row it changed waits, until COMMIT PREPARED.
+func TestTx_PreparedTransactionBlocksRetries(t *testing.T) {
+	L := newLab(t)
+	if L.QueryString("SHOW max_prepared_transactions") == "0" {
+		t.Skip("max_prepared_transactions = 0")
+	}
+	const gid = "lab_prepared"
+	rollbackPrepared := func() { _, _ = L.Admin.Exec("ROLLBACK PREPARED '" + gid + "'") }
+	rollbackPrepared() // left over from an interrupted run; it would block DROP TABLE
+	t.Cleanup(rollbackPrepared)
+	setupRows(L)
+	t1, t2, w := L.Session("T1"), L.Session("T2"), L.Session("W")
+
+	// The write skew of TestIso_WriteSkew_OnCallDoctors: each reads both rows, each updates one.
+	t1.Begin(lab.Serializable)
+	t1.Do("SELECT sum(v) FROM r").MustRows("(0)")
+	t1.Do("UPDATE r SET v = 1 WHERE id = 1")
+	t1.Do("PREPARE TRANSACTION '" + gid + "'").MustOK()
+	L.Note("T1's session is free again; the transaction lives on in pg_prepared_xacts")
+	t1.Do("SELECT gid FROM pg_prepared_xacts WHERE gid = '" + gid + "'").MustRows("(" + gid + ")")
+
+	attempt := func() []*lab.Op {
+		t2.Begin(lab.Serializable)
+		return []*lab.Op{
+			t2.Do("SELECT sum(v) FROM r"),
+			t2.Do("UPDATE r SET v = 1 WHERE id = 2"),
+			t2.Do("COMMIT"),
+		}
+	}
+	for i := 1; i <= 3; i++ {
+		failed := false
+		for _, op := range attempt() {
+			if op.Wait(); op.Err != nil && !op.Skipped {
+				failed = true
+				if !lab.IsSerialization(op.Err) {
+					t.Fatalf("attempt %d: %q failed with %s, want 40001", i, op.SQL, lab.Describe(op.Err))
+				}
+			}
+		}
+		if !failed {
+			t.Fatalf("attempt %d committed although it conflicts with the prepared transaction", i)
+		}
+	}
+	L.Note("three attempts, three serialization failures: retrying cannot help while T1 is prepared")
+
+	upd := w.Do("UPDATE r SET v = v + 10 WHERE id = 1").MustBlock()
+	L.ShowLocks()
+	t1.Do("COMMIT PREPARED '" + gid + "'").MustOK()
+	upd.MustAffect(1)
+	for _, op := range attempt() {
+		op.MustOK()
+	}
+	t2.Do("SELECT id, v FROM r ORDER BY id").MustRows("(1,11) (2,1)")
+}

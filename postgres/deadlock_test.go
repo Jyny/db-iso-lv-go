@@ -115,3 +115,41 @@ func TestDeadlock_ThreeWayCycle(t *testing.T) {
 	}
 	L.WaitAll()
 }
+
+// 13.3.4: the docs' accounts example, statement for statement. Transaction one adds to
+// 11111, transaction two adds to 22222 and then takes from 11111 (waits), transaction one
+// takes from 22222: a cycle, and one of them is aborted so that the other can complete.
+// "If both transactions had updated the rows in the same order, no deadlock would have occurred."
+func TestDeadlock_AccountsDocsExample(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS accounts", "CREATE TABLE accounts (acctnum int primary key, balance numeric)",
+		"INSERT INTO accounts VALUES (11111, 1000.00), (22222, 1000.00)")
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1.Do("BEGIN")
+	t2.Do("BEGIN")
+	t1.Do("UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 11111").MustNotBlock().MustAffect(1)
+	t2.Do("UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 22222").MustNotBlock().MustAffect(1)
+	a := t2.Do("UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 11111").MustBlock()
+	b := t1.Do("UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 22222")
+	victim := lab.ExpectOneDeadlockVictim(t, a, b)
+	L.ShowDeadlock(victim)
+	for _, s := range []*lab.Session{t1, t2} {
+		if s == victim.S {
+			s.Do("ROLLBACK")
+		} else {
+			s.Do("COMMIT").MustOK()
+		}
+	}
+	t1.Do("SELECT sum(balance) FROM accounts").MustRows("(2000.00)")
+
+	L.Note("the same two transfers, both touching 11111 first: the second one queues, no deadlock")
+	t1.Do("BEGIN")
+	t2.Do("BEGIN")
+	t1.Do("UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 11111")
+	w := t2.Do("UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 11111").MustBlock()
+	t1.Do("UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 22222").MustNotBlock().MustAffect(1)
+	t1.Do("COMMIT")
+	w.MustAffect(1)
+	t2.Do("UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 22222").MustAffect(1)
+	t2.Do("COMMIT").MustOK()
+}

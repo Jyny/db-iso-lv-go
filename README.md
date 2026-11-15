@@ -11,7 +11,7 @@ Every conclusion is backed by a test; run it with `-v` to see the full timeline 
 
 ```bash
 make up          # docker-compose starts PG (55432) + MySQL (53306)
-make test        # all experiments (439 tests, about 80 seconds)
+make test        # all experiments (443 tests, about 80 seconds)
 make hermitage   # isolation-level anomaly matrix
 go test -p 1 -count=1 -v ./mysql -run 'TestLock_GapLockOnMissingKey'   # timeline of one experiment
 ```
@@ -113,7 +113,7 @@ Measured with `LOCK TABLE … IN <mode> MODE`; X = blocks. It matches Table 13.2
 | **EXCLUSIVE** | | X | X | X | X | X | X | X |
 | **ACCESS EXCLUSIVE** | X | X | X | X | X | X | X | X |
 
-`TestLock_TableLockAcquiredByCommands` reads `pg_locks` inside the transaction to check which mode each of 23 commands takes (SELECT → AS, FOR UPDATE → RS, DML/MERGE → RE, ANALYZE / COMMENT / CREATE STATISTICS → SUE, CREATE INDEX → S, CREATE TRIGGER / ADD FOREIGN KEY → SRE, REFRESH … CONCURRENTLY → E, TRUNCATE / DROP / CLUSTER / ADD COLUMN / LOCK TABLE → AE).
+`TestLock_TableLockAcquiredByCommands` reads `pg_locks` inside the transaction to check which mode each of 29 commands takes (SELECT → AS, FOR UPDATE / NO KEY UPDATE / SHARE / KEY SHARE → RS, DML / MERGE → RE, ANALYZE / COMMENT / CREATE STATISTICS / `ALTER TABLE … SET (fillfactor)` / `ALTER INDEX … RENAME` → SUE, CREATE INDEX → S, CREATE TRIGGER / ADD FOREIGN KEY → SRE, REFRESH … CONCURRENTLY → E, REFRESH / TRUNCATE / DROP / CLUSTER / ADD COLUMN / LOCK TABLE / REINDEX INDEX → AE). `TestLock_TableLockRequestedByNonTransactionalCommands` does the same for the commands that cannot run in a transaction block (VACUUM, VACUUM FULL, CREATE INDEX / REINDEX CONCURRENTLY).
 🔎 **Found by measurement**: the docs list `REINDEX` under ACCESS EXCLUSIVE, but `REINDEX TABLE` takes only `ShareLock` on the table; the ACCESS EXCLUSIVE is on each index.
 
 ### MySQL InnoDB: record / gap / next-key (`mysql/locks_test.go`, table `t(id PK, k non-unique index)` with values 10/20/30)
@@ -135,7 +135,7 @@ Measured with `LOCK TABLE … IN <mode> MODE`; X = blocks. It matches Table 13.2
 | `NextKeyRangeOnPK` | `id BETWEEN 15 AND 25 FOR UPDATE` | `X 20` + `X,GAP 30` | Blocks inserts in (10,30); 30 itself and >30 are not blocked (fixed in 8.0.18+) |
 | `NonUniqueSecondaryIndex` | `k = 20 FOR UPDATE` | `X (20,20)` + `X,GAP (30,30)` + PK `X,REC_NOT_GAP 20` | Both k=15 and k=25 blocked: a non-unique index must lock the gaps on both sides to prevent phantoms |
 | `NoIndexLocksEverything/RR` | `UPDATE … WHERE v = 20` (v unindexed) | `X` on every row + `supremum` | Effectively a table lock; even INSERT is blocked |
-| `NoIndexLocksEverything/RC` | Same | Only the matching row remains | RC releases non-matching rows (semi-consistent read) |
+| `NoIndexLocksEverything/RC` | Same | Only the matching row remains | RC releases the locks of non-matching rows after evaluating `WHERE` |
 | `RC_NoGapLocks` | `BETWEEN 10 AND 30 FOR UPDATE` under RC | Record locks only | Others can insert 15 → a phantom appears on the second query |
 | `PlainSelectIsNonLocking` | Plain SELECT while another session holds X | RR: no wait, reads undo; **SER: becomes `S,REC_NOT_GAP` and waits** | |
 | `DuplicateKeyCheckWaits` | Inserting the same PK as another uncommitted insert | A freshly inserted row has an **implicit lock** (not in data_locks); on conflict it becomes an explicit `X,REC_NOT_GAP` and the waiter takes `S` | |
@@ -171,6 +171,7 @@ Process 798 waits for ShareLock on transaction 2733; blocked by process 799.
 | Case | Cause |
 |---|---|
 | `OppositeOrder` | Transfers A→B and B→A lock rows in opposite order |
+| `AccountsDocsExample` | The docs' own example (accounts 11111 / 22222), statement for statement; with both transactions touching 11111 first, the second just queues |
 | `AvoidedByLockOrdering` | Fix: lock everything up front in order with `ORDER BY id FOR UPDATE` → transactions queue instead of deadlocking |
 | `ShareLockUpgrade` | Both take `FOR SHARE`, then both UPDATE (S→X upgrade) |
 | `UniqueInsertCrossed` | Cross-inserting the same unique keys; each waits for the other's outcome |
@@ -236,11 +237,11 @@ Every [Hermitage](https://github.com/ept/hermitage) anomaly runs automatically o
 
 ### The Hermitage documents, replayed (`TestHermitageDocs`)
 
-The matrix runs one script per anomaly on every level. Hermitage's own documents use a different statement order at some levels (where a lock would otherwise get in the way), and say what every statement shows. `TestHermitageDocs` replays all 20 code blocks of [postgres.md](https://github.com/ept/hermitage/blob/master/postgres.md) and all 26 of [mysql.md](https://github.com/ept/hermitage/blob/master/mysql.md) verbatim, with the documents' own `begin` / `set transaction` preamble, and asserts each comment: the rows shown, `BLOCKS`, the error printed.
+The matrix runs one script per anomaly on every level. Hermitage's own documents use a different statement order at some levels (where a lock would otherwise get in the way), and say what every statement shows. `TestHermitageDocs` replays all 20 code blocks of [postgres.md](https://github.com/ept/hermitage/blob/master/postgres.md) and all 26 of [mysql.md](https://github.com/ept/hermitage/blob/master/mysql.md) verbatim, with the documents' own `begin` / `set transaction` preamble, and asserts each comment: the rows shown, `BLOCKS`, the error printed, and which statement unblocks a blocked one ("This unblocks T2"): a blocked statement must stay blocked until exactly that statement.
 
 PostgreSQL 18.6 does exactly what the document recorded on 9.3.5. MySQL 9.7.4 differs from the 5.6.21 document in one block:
 
-- **PMP for write predicates, SERIALIZABLE**: the document's `update` (T1) dies with a deadlock when T2 runs its `delete`. On 9.7 there is no deadlock: T1 keeps waiting, T2 deletes and commits, and T1 then updates the remaining row. The anomaly is still prevented (serial order T2 → T1).
+- **PMP for write predicates, SERIALIZABLE**: the document's `update` (T1) dies with a deadlock when T2 runs its `delete`. On 9.7 there is no deadlock: T1 keeps waiting until T2 commits (not until T2's `delete`), and then updates the one row T2 left. The anomaly is still prevented (serial order T2 → T1).
 
 ### Key takeaways from the matrix
 
@@ -330,11 +331,11 @@ Every section of [PostgreSQL 18 Chapter 13, Concurrency Control](https://www.pos
 | 13.3.1 Table-Level Locks | `TestLock_TableLockConflictMatrix`, `TestLock_TableLockAcquiredByCommands` (29 commands), `TestLock_TableLockRequestedByNonTransactionalCommands` (VACUUM, VACUUM FULL, CREATE INDEX / REINDEX CONCURRENTLY), `TestLock_TableLockOwnTxnAndSavepoint`, `TestLock_TableLockReleasedByExceptionBlock`, `TestLock_DDLLockQueue` |
 | 13.3.2 Row-Level Locks | `TestLock_RowLockConflictMatrix`, `TestLock_RowLocksTakenByStatements` (partial and expression unique indexes do not count as keys), `TestIso_RC_LockingReadReturnsUpdatedRow`, `TestLock_RowLockSavepoints`, `TestLock_RowLocksNotInLockTable`, `TestLock_ForeignKeyAndNoKeyUpdate`, `TestLock_SharedRowLocksBlockWriters` (FOR KEY SHARE / FOR SHARE vs UPDATE, key UPDATE, DELETE), `TestMVCC_RowLocksLiveInTupleHeader` |
 | 13.3.3 Page-Level Locks | not observable from SQL (buffer content locks, released right after each row access) |
-| 13.3.4 Deadlocks | `TestDeadlock_OppositeOrder` (the accounts example), `TestDeadlock_TableLocksOppositeOrder`, `TestDeadlock_AvoidedByLockOrdering`, `TestDeadlock_AvoidedByStrongestLockFirst`, the other `postgres/deadlock_test.go` cases |
+| 13.3.4 Deadlocks | `TestDeadlock_AccountsDocsExample` (the accounts example, verbatim, and the same-order fix), `TestDeadlock_OppositeOrder`, `TestDeadlock_TableLocksOppositeOrder`, `TestDeadlock_AvoidedByLockOrdering`, `TestDeadlock_AvoidedByStrongestLockFirst`, the other `postgres/deadlock_test.go` cases |
 | 13.3.5 Advisory Locks | `TestLock_AdvisorySemantics` (rollback, failed txn, stacking, xact vs session, reentrancy), `TestLock_AdvisoryReleasedAtSessionEnd`, `TestLock_AdvisoryLockFilterPitfall`, `TestLock_Advisory` |
 | 13.4.1 Serializable consistency | `TestIso_WriteSkew_OnCallDoctors`, `TestIso_SER_MytabDocsExample`, `TestIso_DefaultSerializableAndTriggerGuard` (`default_transaction_isolation`, a trigger rejecting other levels) |
 | 13.4.2 Explicit blocking locks | `TestLock_ForUpdateLocksOnlyReturnedRows`, `TestIso_RR_ConcurrentChangeOutcomes` (lock-only vs no-op UPDATE), `TestIso_RR_LockTableBeforeSnapshot` |
-| 13.5 Serialization Failure Handling | 40001 / 40P01 / 23505 / 23P01 across the tests above, `TestLock_ExclusionConstraintWaitsForOutcome`, retries in `jepsen` |
+| 13.5 Serialization Failure Handling | 40001 / 40P01 / 23505 / 23P01 across the tests above, `TestLock_ExclusionConstraintWaitsForOutcome`, retries in `jepsen`, `TestTx_PreparedTransactionBlocksRetries` (retries keep failing, and a writer keeps waiting, until `COMMIT PREPARED`) |
 | 13.6 Caveats | `TestMVCC_TruncateIsNotMVCCSafe` (TRUNCATE, rewriting ALTER, DELETE for contrast, blocked when already read), `TestMVCC_CatalogAccessIgnoresSnapshot`. Hot standby: not covered (no replica) |
 | 13.7 Locking and Indexes | not observable from SQL (short-term page / bucket locks inside index access methods) |
 
@@ -357,7 +358,7 @@ Every section of [PostgreSQL 18 Chapter 13, Concurrency Control](https://www.pos
 | 17.7.1 AUTO-INC locks | `TestLock_AutoIncInterleavedMode` (mode 2, the 8.0+ default; modes 0/1 need a restart) |
 | 17.7.1 Predicate locks (spatial) | `TestLock_SpatialPredicateLock` (`S,PREDICATE` in data_locks; blocks inserts and updates into the MBR) |
 | 17.7.2 Transaction model (no lock escalation) | `TestLock_NoLockEscalation` (10,000 record locks, table lock stays IX) |
-| 17.7.2.1 Isolation levels | `hermitage`, `TestTx_IsolationLevelDefaultAndScope` (default, SESSION vs GLOBAL), `TestLock_SemiConsistentReadDocsExample` (the manual's (a,b) table, RC / RR / indexed, locks kept), `TestLock_RC_DeleteReleasesNonMatchingRowsButWaits`, `TestLock_RC_GapLockForDuplicateKeyCheck`, `TestIso_RU_DirtyRead`, `TestIso_SER_AutocommitSelectStaysNonLocking`, `TestLock_PlainSelectIsNonLocking`, `TestTx_ReadCommittedRequiresRowBinlog`, `TestLock_GrantTablesAreReadWithoutLocks` |
+| 17.7.2.1 Isolation levels | `hermitage`, `TestTx_IsolationLevelDefaultAndScope` (default, SESSION vs GLOBAL), `TestLock_SemiConsistentReadDocsExample` (the manual's (a,b) table, RC / RR / indexed, locks kept), `TestLock_RC_DeleteReleasesNonMatchingRowsButWaits` (the semi-consistent read is for `UPDATE` only, as the manual says: a second `DELETE` waits at the first locked row), `TestLock_RC_GapLockForDuplicateKeyCheck`, `TestIso_RU_DirtyRead`, `TestIso_SER_AutocommitSelectStaysNonLocking`, `TestLock_PlainSelectIsNonLocking`, `TestTx_ReadCommittedRequiresRowBinlog`, `TestLock_GrantTablesAreReadWithoutLocks` |
 | 17.7.2.2 autocommit, Commit, Rollback | `TestTx_AutocommitCommitRollback` (customer example, implicit commit, disconnect rollback) |
 | 17.7.2.3 Consistent nonlocking reads | `TestMVCC_ReadViewCreatedAtFirstRead`, `TestMVCC_SnapshotIgnoresLaterDeleteUpdateInsert`, `TestMVCC_DMLSeesRowsTheSnapshotCannot` (xyz / abc), `TestMVCC_TimepointAdvancesAfterCommitDocsExample`, `TestMVCC_ConsistentReadOverDDL` (1412 / 1146), `TestLock_InsertSelectLocksSource`, `TestLock_CreateTableSelectLocksSource` |
 | 17.7.2.4 Locking reads | `TestLock_LockingReadsDocs` (NOWAIT / SKIP LOCKED verbatim and with FOR SHARE, row locks only, unsafe for statement binlog, LOCK IN SHARE MODE, autocommit, subqueries, OF table, parent/child with and without the lock, counter, LAST_INSERT_ID), `TestLock_LockingReadPrivileges`, `Manual_CounterForShare` deadlock |
@@ -365,7 +366,7 @@ Every section of [PostgreSQL 18 Chapter 13, Concurrency Control](https://www.pos
 | 17.7.4 Phantom rows | `TestLock_InsertIntentionAndPhantomDocsExample`, `TestMVCC_RR_PhantomAppearsAfterUpdate` |
 | 17.7.5 Deadlocks | `mysql/deadlock_test.go`, `TestDeadlock_AtEveryIsolationLevel` |
 | 17.7.5.1 Deadlock example | `TestDeadlock_ManualAnimalsBirds` (the 4 and 6 rows of data_locks, data_lock_waits, `LATEST DETECTED DEADLOCK` text, `lock_deadlocks` metric, error log) |
-| 17.7.5.2 Deadlock detection | `TestDeadlock_VictimIsSmallerTransaction`, `TestDeadlock_DetectionDisabledFallsBackToTimeout`, `TestTx_LockWaitTimeoutRollsBackOnlyStatement`, `TestDeadlock_UndetectedAcrossStorageEngines` (MyISAM table lock + InnoDB row lock → timeout), `TestDeadlock_LockTablesDetectedByMetadataLocks`. The 200-transaction wait-for limit is not covered (needs more than `max_connections` sessions) |
+| 17.7.5.2 Deadlock detection | `TestDeadlock_VictimIsSmallerTransaction`, `TestDeadlock_DetectionDisabledFallsBackToTimeout`, `TestTx_LockWaitTimeoutRollsBackOnlyStatement`, `TestDeadlock_UndetectedAcrossStorageEngines` (MyISAM table lock + InnoDB row lock → timeout), `TestDeadlock_LockTablesDetectedByMetadataLocks` (autocommit = 0 and 1). The 200-transaction wait-for limit is not covered (needs more than `max_connections` sessions) |
 | 17.7.5.3 Minimizing deadlocks | `TestDeadlock_AvoidedBySemaphoreRow`, `TestDeadlock_AvoidedByLockTables`, `CheckThenInsert_ReadCommitted` |
 | 17.7.6 Transaction scheduling | `TestLock_CATSSchedulesHeaviestWaiterFirst` (`TRX_SCHEDULE_WEIGHT`, grant order), `TestLock_CATSEqualWeightIsFIFO` (longest waiter first, the three `INNODB_METRICS` counters) |
 
@@ -374,13 +375,14 @@ Every section of [PostgreSQL 18 Chapter 13, Concurrency Control](https://www.pos
 - Deleting a parent row checks the FK in the child table, which leaves an `S` lock on the empty child index's supremum.
 - The manual says READ COMMITTED still uses gap locks for foreign-key checks. Neither FK check tested leaves one: a child insert with a missing parent leaves no lock at all (REPEATABLE READ leaves `S,GAP`), and a parent delete leaves nothing in the child index (REPEATABLE READ leaves `S` on its supremum). The duplicate-key check does take one (`TestLock_RC_GapLockForDuplicateKeyCheck`).
 - The manual says a locking read through a unique index releases the locks of scanned rows that fail the `WHERE` clause. That holds only in READ COMMITTED, and not for a row found by a constant primary-key lookup (`id = 20 AND v = 99` keeps `X,REC_NOT_GAP` on 20). REPEATABLE READ keeps every lock. The `UNION` exception (rows stay locked) does not show up for a simple two-branch `UNION`.
+- The manual says `REPLACE` places "an exclusive next-key lock … on the row to be replaced". On a primary-key collision it is a record lock without the gap (`X,REC_NOT_GAP`); a collision on a unique secondary index does take next-key locks.
 - A duplicate on a unique secondary index (plain INSERT or `ON DUPLICATE KEY UPDATE`) also leaves `X` on the clustered index's supremum: the clustered record was inserted before the duplicate was found, and rolling it back passes its gap lock on (lock inheritance).
 
 🔎 Other places where MySQL 9.7 differs from the 8.4 manual:
-- `innodb_table_locks = 0` drops the InnoDB table lock for `LOCK TABLES … WRITE` too; the manual says the variable has no effect on WRITE locks from 8.4 on (`TestLock_InnoDBTableLocksVariable`).
-- The manual says a deadlock that involves a `LOCK TABLES` table lock cannot be detected and needs a timeout. InnoDB does not detect it, but `LOCK TABLES` waits on metadata locks, which have their own deadlock detector: the other transaction fails at once with ERROR 1213 (`TestDeadlock_LockTablesDetectedByMetadataLocks`). A cycle through another storage engine's table lock (MyISAM) is still broken only by `innodb_lock_wait_timeout`.
-- READ COMMITTED's semi-consistent read is for `UPDATE` only: a second `DELETE` waits at the first locked row that an `UPDATE` would have skipped (`TestLock_RC_DeleteReleasesNonMatchingRowsButWaits`).
-- With `innodb_table_locks = 0`, the manual says `LOCK TABLES` "completes even if other transactions hold row locks". It still waits, in `Waiting for table metadata lock`: the other transaction's metadata lock, held until it ends, blocks it before InnoDB is asked.
+- `innodb_table_locks = 0` drops the InnoDB table lock for `LOCK TABLES … WRITE` too; the manual says that in MySQL 8.4 the setting "has no effect for tables locked explicitly with `LOCK TABLES ... WRITE`" (`TestLock_InnoDBTableLocksVariable`).
+- The manual says InnoDB can detect a deadlock that involves a `LOCK TABLES` table lock only with `innodb_table_locks = 1` and `autocommit = 0`, and that otherwise (17.7.5.3: "with MySQL table-level locks") the timeout method must be used. With either autocommit setting the cycle never reaches InnoDB (`lock_deadlocks` does not move): `LOCK TABLES` waits on metadata locks, which have their own deadlock detector, and the other transaction fails at once with ERROR 1213 (`TestDeadlock_LockTablesDetectedByMetadataLocks`). A cycle through another storage engine's table lock (MyISAM) is still broken only by `innodb_lock_wait_timeout`.
+- 17.7.5 says that with deadlock detection disabled InnoDB relies on `innodb_lock_wait_timeout` "to roll back transactions". The timeout (ERROR 1205) rolls back only the waiting statement (`innodb_rollback_on_timeout` is OFF by default); the transaction keeps its locks, and the cycle is gone only once the application rolls it back (`TestDeadlock_DetectionDisabledFallsBackToTimeout`).
+- With `innodb_table_locks = 0`, the manual says `LOCK TABLES` completes even if other transactions hold locks on some records of the table. It still waits, in `Waiting for table metadata lock`: the other transaction's metadata lock, held until it ends, blocks it before InnoDB is asked.
 
 ### Not covered
 
@@ -399,7 +401,6 @@ These claims have no test: they either cannot be observed from SQL, or need a se
 |---|---|
 | PG 13.6: hot standby supports at most REPEATABLE READ; a standby RR transaction can briefly see a state no serial order of the primary produces | A streaming replica container (`standby.signal` + `primary_conninfo`). Then: `SERIALIZABLE` on the standby fails, and the RO-anomaly shows up there. |
 | PG 13.3.5: the number of advisory locks is limited by the shared lock table (`max_locks_per_transaction` × `max_connections`) | Exhausting it makes the whole server unable to grant any lock ("out of shared memory") while the test runs; it needs a throwaway server. |
-| PG 13.5: a conflicting prepared transaction can block progress until it commits or rolls back | `max_prepared_transactions` > 0 (it is 0 by default). |
 | MySQL 17.7.5.2: a wait-for chain over 200 transactions, or a search over 1,000,000 locks, is treated as a deadlock (`TOO DEEP OR LONG SEARCH …`) | Over 200 concurrent sessions, while the default `max_connections` is 151. It is worth running: deadlock detection was rewritten in 8.0.18, so whether the limit still applies on 9.7 is open. |
 | MySQL 17.7.3: initializing an `AUTO_INCREMENT` counter sets an exclusive lock on the end of the index | This happens once, when the table is first used after a server start, so observing it needs a restart mid-test. |
 | MySQL 17.7.1 / 17.7.3: `innodb_autoinc_lock_mode` 0 (table AUTO-INC lock for every INSERT) and 1 (table lock only for bulk inserts) | The variable is read-only at runtime; each mode needs its own server (`--innodb-autoinc-lock-mode=0` / `=1`). Only mode 2, the 8.0+ default, is tested. |

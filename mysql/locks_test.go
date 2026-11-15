@@ -132,7 +132,9 @@ func TestLock_NonUniqueSecondaryIndex(t *testing.T) {
 
 // Without a usable index, a locking statement scans the clustered index and, in
 // REPEATABLE READ, locks every row and every gap: effectively a table lock.
-// In READ COMMITTED, InnoDB releases locks on rows that don't match ("semi-consistent read").
+// In READ COMMITTED, InnoDB releases the locks on rows that don't match once the WHERE clause
+// has been evaluated. (The "semi-consistent read", which lets a second UPDATE skip rows that
+// are still locked, is a separate READ COMMITTED feature: TestLock_SemiConsistentReadDocsExample.)
 func TestLock_NoIndexLocksEverything(t *testing.T) {
 	for _, level := range []lab.Level{lab.RepeatableRead, lab.ReadCommitted} {
 		t.Run(level.Short(), func(t *testing.T) {
