@@ -12,8 +12,10 @@ func setupAccounts(L *lab.Lab) {
 }
 
 // Classic: two transfers lock the same rows in opposite order.
-// PG runs the deadlock detector only after waiting deadlock_timeout (here 100ms); the
-// process that runs it and finds the cycle aborts itself.
+// PG runs the deadlock detector only after waiting deadlock_timeout (here 100ms). In the
+// current implementation the process that runs it and finds the cycle aborts itself, but
+// 13.3.4 says which transaction is aborted "is difficult to predict and should not be relied
+// upon", so the tests assert only that exactly one is.
 func TestDeadlock_OppositeOrder(t *testing.T) {
 	L := newLab(t)
 	setupAccounts(L)
@@ -140,6 +142,18 @@ func TestDeadlock_AccountsDocsExample(t *testing.T) {
 			s.Do("COMMIT").MustOK()
 		}
 	}
+	t1.Do("SELECT sum(balance) FROM accounts").MustRows("(2000.00)")
+
+	L.Note("13.3.4: deadlocks can be handled on the fly by retrying: the victim's transfer, run again, now succeeds")
+	retry := victim.S
+	retry.Do("BEGIN")
+	for _, sql := range []string{
+		"UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 22222",
+		"UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 11111",
+	} {
+		retry.Do(sql).MustNotBlock().MustAffect(1)
+	}
+	retry.Do("COMMIT").MustOK()
 	t1.Do("SELECT sum(balance) FROM accounts").MustRows("(2000.00)")
 
 	L.Note("the same two transfers, both touching 11111 first: the second one queues, no deadlock")

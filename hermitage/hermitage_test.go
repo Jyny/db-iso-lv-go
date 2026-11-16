@@ -147,7 +147,7 @@ var scenarios = []scenario{
 		},
 	},
 	{
-		name: "PMP", desc: "Predicate-Many-Preceders (phantom read): the same predicate read twice returns a newly inserted row",
+		name: "PMP", desc: "Predicate-Many-Preceders (phantom read): a later predicate read (value % 3 = 0) sees a row a concurrent transaction inserted after an earlier one (value = 30) found none",
 		run: func(e *env) bool {
 			e.begin()
 			r1 := e.T1.Do("select * from test where value = 30")
@@ -161,6 +161,10 @@ var scenarios = []scenario{
 	},
 	{
 		name: "PMP-write", desc: "Predicate-Many-Preceders (write): DELETE's predicate mixes old and new row versions",
+		// mysql.md's repeatable-read interleaving on every DB and level: T2's SELECT comes
+		// after T1's UPDATE (postgres.md has no SELECT; harmless on PG). mysql.md's
+		// serializable block puts the SELECT before the UPDATE, which deadlocks instead of
+		// waiting; that variant is replayed in TestHermitageDocs.
 		run: func(e *env) bool {
 			e.begin()
 			e.T1.Do("update test set value = value + 10")
@@ -264,7 +268,7 @@ var scenarios = []scenario{
 		},
 	},
 	{
-		name: "G2", desc: "Predicate Anti-dependency Cycles: both read a predicate, each inserts a row matching the other's",
+		name: "G2", desc: "Anti-dependency Cycles (write skew on a predicate read): both read a predicate, each inserts a row matching the other's",
 		run: func(e *env) bool {
 			e.begin()
 			r1 := e.T1.Do("select * from test where value % 3 = 0")
@@ -321,6 +325,10 @@ const (
 // expected[db][level], in scenarios order.
 var expected = map[lab.Kind]map[lab.Level][]string{
 	lab.Postgres: {
+		// SER G1c is "abort", not "mvcc" as under RR: neither transaction sees the other's
+		// uncommitted write (snapshot), but each also reads the row the other wrote, an
+		// rw/rw cycle (G2-item) that SSI rejects with 40001.
+		//
 		//                      G0  G1a G1b G1c OTV PMP PMPw P4 Gs  Gsp Gsw G2i G2 RO
 		lab.ReadUncommitted: {lk, mv, mv, mv, lk, A, A, A, A, A, A, A, A, A},
 		lab.ReadCommitted:   {lk, mv, mv, mv, lk, A, A, A, A, A, A, A, A, A},
@@ -337,7 +345,10 @@ var expected = map[lab.Kind]map[lab.Level][]string{
 	},
 }
 
-// mechanism tells how an anomaly was prevented.
+// mechanism labels a prevented cell by what was observed: the first serialization failure or
+// deadlock anywhere in the history, otherwise "lock" if any statement waited, otherwise "mvcc".
+// It is a label of the run, not a proof that this is what decided the anomaly: in OTV the
+// "lock" is T2 waiting on T1's row (G0 protection), while T3's reads see only committed data.
 func mechanism(L *lab.Lab) string {
 	blocked := false
 	for _, op := range L.History() {

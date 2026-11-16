@@ -170,17 +170,26 @@ func TestLock_NoIndexLocksEverything(t *testing.T) {
 }
 
 // READ COMMITTED takes no gap locks for searches, so a phantom can be inserted
-// into a range another transaction has "locked".
+// into a range another transaction has "locked". READ UNCOMMITTED "otherwise works like
+// READ COMMITTED" (17.7.2.1): the same.
 func TestLock_RC_NoGapLocks(t *testing.T) {
-	L := newLab(t)
-	setupT(L)
-	t1, t2 := L.Session("T1"), L.Session("T2")
-	t1.Begin(lab.ReadCommitted)
-	t1.Do("SELECT id FROM t WHERE id BETWEEN 10 AND 30 FOR UPDATE").MustRows("(10) (20) (30)")
-	L.ShowLocks()
-	t2.Do("INSERT INTO t VALUES (15, 15, 0)").MustNotBlock().MustOK()
-	t1.Do("SELECT id FROM t WHERE id BETWEEN 10 AND 30 FOR UPDATE").MustRows("(10) (15) (20) (30)")
-	t1.Do("COMMIT")
+	for _, level := range []lab.Level{lab.ReadCommitted, lab.ReadUncommitted} {
+		t.Run(level.Short(), func(t *testing.T) {
+			L := newLab(t)
+			setupT(L)
+			t1, t2 := L.Session("T1"), L.Session("T2")
+			t1.Begin(level)
+			t1.Do("SELECT id FROM t WHERE id BETWEEN 10 AND 30 FOR UPDATE").MustRows("(10) (20) (30)")
+			for _, k := range L.ShowLocks() {
+				if k.Type == "RECORD" && k.Mode != "X,REC_NOT_GAP" {
+					t.Errorf("%s: unexpected %s lock on %s", level, k.Mode, k.Data)
+				}
+			}
+			t2.Do("INSERT INTO t VALUES (15, 15, 0)").MustNotBlock().MustOK()
+			t1.Do("SELECT id FROM t WHERE id BETWEEN 10 AND 30 FOR UPDATE").MustRows("(10) (15) (20) (30)")
+			t1.Do("COMMIT")
+		})
+	}
 }
 
 // FOR SHARE vs FOR UPDATE, NOWAIT and SKIP LOCKED.
