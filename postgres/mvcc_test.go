@@ -65,7 +65,8 @@ func TestMVCC_RollbackLeavesTupleOnDisk(t *testing.T) {
 	}
 }
 
-// For REPEATABLE READ the snapshot is taken at the first statement, not at BEGIN.
+// For REPEATABLE READ the snapshot is taken at the first query, not at BEGIN, and not by
+// SET or SAVEPOINT either.
 // A snapshot is just (xmin, xmax, in-progress xids): see pg_current_snapshot().
 func TestMVCC_SnapshotTakenAtFirstStatement(t *testing.T) {
 	L := newLab(t)
@@ -77,8 +78,11 @@ func TestMVCC_SnapshotTakenAtFirstStatement(t *testing.T) {
 	L.Note("T3 stays open with xid %s, so it will show up as in-progress in T1's snapshot", xid3)
 
 	t1.Do("BEGIN ISOLATION LEVEL REPEATABLE READ")
+	t1.Do("SET LOCAL work_mem = '8MB'")
+	t1.Do("SET TRANSACTION READ WRITE")
+	t1.Do("SAVEPOINT a")
 	t2.Do("UPDATE mv SET v = 11 WHERE id = 1")
-	L.Note("T2 committed (autocommit) AFTER T1's BEGIN but BEFORE T1's first query")
+	L.Note("T2 committed (autocommit) AFTER T1's BEGIN, SET and SAVEPOINT but BEFORE T1's first query")
 	t1.Do("SELECT v FROM mv").MustRows("(11)")
 	snap := t1.Do("SELECT pg_current_snapshot()").Str()
 	L.Note("T1's snapshot xmin:xmax:xip = %s; every xid listed is invisible to T1", snap)

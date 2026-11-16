@@ -12,8 +12,10 @@ func setupAccounts(L *lab.Lab) {
 }
 
 // Classic: two transfers lock the same rows in opposite order.
-// PG runs the deadlock detector only after waiting deadlock_timeout (here 100ms); the
-// process that runs it and finds the cycle aborts itself.
+// PG runs the deadlock detector only after waiting deadlock_timeout (here 100ms). In the
+// current implementation the process that runs it and finds the cycle aborts itself, but
+// 13.3.4 says which transaction is aborted "is difficult to predict and should not be relied
+// upon", so the tests assert only that exactly one is.
 func TestDeadlock_OppositeOrder(t *testing.T) {
 	L := newLab(t)
 	setupAccounts(L)
@@ -114,4 +116,67 @@ func TestDeadlock_ThreeWayCycle(t *testing.T) {
 		}
 	}
 	L.WaitAll()
+}
+
+// 13.3.4: the docs' accounts example, statement for statement. Transaction one adds to
+// 11111, transaction two adds to 22222 and then takes from 11111 (waits), transaction one
+// takes from 22222: a cycle, and one of them is aborted so that the other can complete.
+// "If both transactions had updated the rows in the same order, no deadlock would have occurred."
+func TestDeadlock_AccountsDocsExample(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS accounts", "CREATE TABLE accounts (acctnum int primary key, balance numeric)",
+		"INSERT INTO accounts VALUES (11111, 1000.00), (22222, 1000.00)")
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1.Do("BEGIN")
+	t2.Do("BEGIN")
+	t1.Do("UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 11111").MustNotBlock().MustAffect(1)
+	t2.Do("UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 22222").MustNotBlock().MustAffect(1)
+	a := t2.Do("UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 11111").MustBlock()
+	b := t1.Do("UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 22222")
+	victim := lab.ExpectOneDeadlockVictim(t, a, b)
+	L.ShowDeadlock(victim)
+	for _, s := range []*lab.Session{t1, t2} {
+		if s == victim.S {
+			s.Do("ROLLBACK")
+		} else {
+			s.Do("COMMIT").MustOK()
+		}
+	}
+	// Only the survivor's transfer is applied. Which one survives is not asserted.
+	afterFirst := "(11111,1100.00) (22222,900.00)"
+	if victim.S == t1 {
+		afterFirst = "(11111,900.00) (22222,1100.00)"
+	}
+	t1.Do("SELECT acctnum, balance FROM accounts ORDER BY acctnum").MustRows(afterFirst)
+
+	L.Note("13.3.4: deadlocks can be handled on the fly by retrying: the victim's own transfer, run again, now succeeds")
+	transfer := map[*lab.Session][]string{
+		t1: {
+			"UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 11111",
+			"UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 22222",
+		},
+		t2: {
+			"UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 22222",
+			"UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 11111",
+		},
+	}
+	retry := victim.S
+	retry.Do("BEGIN")
+	for _, sql := range transfer[retry] {
+		retry.Do(sql).MustNotBlock().MustAffect(1)
+	}
+	retry.Do("COMMIT").MustOK()
+	L.Note("both transfers applied exactly once")
+	t1.Do("SELECT acctnum, balance FROM accounts ORDER BY acctnum").MustRows("(11111,1000.00) (22222,1000.00)")
+
+	L.Note("the same two transfers, both touching 11111 first: the second one queues, no deadlock")
+	t1.Do("BEGIN")
+	t2.Do("BEGIN")
+	t1.Do("UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 11111")
+	w := t2.Do("UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 11111").MustBlock()
+	t1.Do("UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 22222").MustNotBlock().MustAffect(1)
+	t1.Do("COMMIT")
+	w.MustAffect(1)
+	t2.Do("UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 22222").MustAffect(1)
+	t2.Do("COMMIT").MustOK()
 }

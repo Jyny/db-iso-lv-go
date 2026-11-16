@@ -11,7 +11,7 @@ import (
 // close a cycle, and rolls back the transaction with the smaller "weight" (fewer rows
 // changed/locked). The victim's WHOLE transaction is rolled back (ERROR 1213).
 //
-// Cases marked "aneasystone #N" are ported from https://github.com/alleycat1/mysql-deadlocks-case
+// Cases marked "case #N" are ported from https://github.com/alleycat1/mysql-deadlocks-case
 // (originally reproduced on MySQL 5.7). The `deadlock` field records what MySQL 9.7 does.
 
 type step struct {
@@ -33,7 +33,7 @@ type deadlockCase struct {
 
 var deadlockCases = []deadlockCase{
 	{
-		name: "OppositeOrder", ref: "aneasystone #8",
+		name: "OppositeOrder", ref: "case #8",
 		why: "T1 locks 10 then 20, T2 locks 20 then 10",
 		steps: []step{
 			{1, "DELETE FROM t WHERE id = 10"},
@@ -44,7 +44,7 @@ var deadlockCases = []deadlockCase{
 		deadlock: true,
 	},
 	{
-		name: "CheckThenInsert_GapLocks", ref: "aneasystone #1 (pattern)",
+		name: "CheckThenInsert_GapLocks", ref: "case #1 (pattern)",
 		why: "both lock the same gap with FOR UPDATE on a missing key (gap locks are compatible),\n" +
 			"then each INSERT needs an insert-intention lock that conflicts with the other's gap lock",
 		steps: []step{
@@ -56,7 +56,7 @@ var deadlockCases = []deadlockCase{
 		deadlock: true,
 	},
 	{
-		name: "DuplicateInsertThenRollback", ref: "aneasystone #2 / MySQL manual",
+		name: "DuplicateInsertThenRollback", ref: "case #2 / MySQL manual",
 		why: "T2 and T3 both wait with S locks on T1's uncommitted duplicate; when T1 rolls back\n" +
 			"both get S, and both then need X to insert → each waits for the other's S",
 		setup: []string{
@@ -72,7 +72,7 @@ var deadlockCases = []deadlockCase{
 		deadlock: true,
 	},
 	{
-		name: "DeleteThenReinsertSameKey", ref: "aneasystone #18",
+		name: "DeleteThenReinsertSameKey", ref: "case #18",
 		why: "T1 deletes id=4 (X record lock); T2's delete waits; T1 re-inserts 4 and its duplicate\n" +
 			"check on the delete-marked record queues behind T2's waiting X request",
 		setup: []string{
@@ -90,7 +90,7 @@ var deadlockCases = []deadlockCase{
 			"record, so the re-insert's duplicate check does not queue behind T2's waiting request",
 	},
 	{
-		name: "UniqueSecondary_DeleteInsert", ref: "aneasystone #4",
+		name: "UniqueSecondary_DeleteInsert", ref: "case #4",
 		why: "T2 deletes a=2; T1's delete of a=2 waits; T2 re-inserts a=2, whose duplicate check\n" +
 			"needs S on the delete-marked a=2, conflicting with T1's waiting X",
 		setup: []string{
@@ -108,7 +108,7 @@ var deadlockCases = []deadlockCase{
 			"delete-marked a=2 (it already holds X on the record), which never wait for T1's X request",
 	},
 	{
-		name: "NonUniqueSecondary_DeleteInsertGap", ref: "aneasystone #12",
+		name: "NonUniqueSecondary_DeleteInsertGap", ref: "case #12",
 		why: "T1 deletes a=5 (next-key lock (2,5] + gap (5,6)); T2's delete of a=5 waits;\n" +
 			"T1 inserts a=2 into the gap before 5, which T2's WAITING next-key request also covers",
 		setup: []string{
@@ -124,7 +124,7 @@ var deadlockCases = []deadlockCase{
 		deadlock: true,
 	},
 	{
-		name: "UniqueSecondary_InsertInsert", ref: "aneasystone #15",
+		name: "UniqueSecondary_InsertInsert", ref: "case #15",
 		why: "T1's insert of a=10 waits with a next-key S lock on T2's uncommitted a=10;\n" +
 			"T2's next insert (a=9) lands in the gap that T1's waiting S lock covers",
 		setup: []string{
@@ -140,7 +140,7 @@ var deadlockCases = []deadlockCase{
 		deadlock: true,
 	},
 	{
-		name: "UpdateUniqueKey_ThreeSessions", ref: "aneasystone #11",
+		name: "UpdateUniqueKey_ThreeSessions", ref: "case #11",
 		why: "three updates of the same unique-key row wait in line; after T1 commits, T2 and T3\n" +
 			"both get S locks on the new index entry and then both need X",
 		setup: []string{
@@ -159,6 +159,57 @@ var deadlockCases = []deadlockCase{
 			"S locks that later need upgrading, so they simply queue",
 	},
 	{
+		name: "Manual_InsertDuplicatePK_3Sessions", ref: "MySQL manual 17.7.3 (INSERT)",
+		why: "the manual's t1(i PK) example: T2 and T3 wait with S locks on T1's uncommitted 1;\n" +
+			"T1 rolls back, both S locks are granted, and both need X to insert",
+		setup: []string{"DROP TABLE IF EXISTS t1", "CREATE TABLE t1 (i INT, PRIMARY KEY (i)) ENGINE = InnoDB"},
+		steps: []step{
+			{1, "INSERT INTO t1 VALUES (1)"},
+			{2, "INSERT INTO t1 VALUES (1)"},
+			{3, "INSERT INTO t1 VALUES (1)"},
+			{1, "ROLLBACK"},
+		},
+		deadlock: true,
+	},
+	{
+		name: "Manual_DeleteThenInsertPK_3Sessions", ref: "MySQL manual 17.7.3 (INSERT, second variant)",
+		why: "T1 deletes the existing row 1; T2 and T3 insert 1 and wait with S locks; T1 commits,\n" +
+			"both S locks are granted on the delete-marked record, and both need X",
+		setup: []string{"DROP TABLE IF EXISTS t1", "CREATE TABLE t1 (i INT, PRIMARY KEY (i)) ENGINE = InnoDB", "INSERT INTO t1 VALUES (1)"},
+		steps: []step{
+			{1, "DELETE FROM t1 WHERE i = 1"},
+			{2, "INSERT INTO t1 VALUES (1)"},
+			{3, "INSERT INTO t1 VALUES (1)"},
+			{1, "COMMIT"},
+		},
+		deadlock: true,
+	},
+	{
+		name: "Manual_CounterForShare", ref: "MySQL manual 17.7.2.4",
+		why: "reading a counter FOR SHARE and then incrementing it: both hold S, both need X",
+		setup: []string{"DROP TABLE IF EXISTS child_codes", "CREATE TABLE child_codes (id int PRIMARY KEY, counter_field int)",
+			"INSERT INTO child_codes VALUES (1, 0)"},
+		steps: []step{
+			{1, "SELECT counter_field FROM child_codes FOR SHARE"},
+			{2, "SELECT counter_field FROM child_codes FOR SHARE"},
+			{1, "UPDATE child_codes SET counter_field = counter_field + 1"},
+			{2, "UPDATE child_codes SET counter_field = counter_field + 1"},
+		},
+		deadlock: true,
+	},
+	{
+		name: "CheckThenInsert_ReadCommitted", ref: "MySQL manual 17.7.5.3", level: lab.ReadCommitted,
+		why: "the same check-then-insert as CheckThenInsert_GapLocks, but READ COMMITTED takes no gap\n" +
+			"locks for searches, so there is nothing for the inserts to collide with",
+		steps: []step{
+			{1, "SELECT * FROM t WHERE id = 15 FOR UPDATE"},
+			{2, "SELECT * FROM t WHERE id = 16 FOR UPDATE"},
+			{1, "INSERT INTO t VALUES (15, 15, 0)"},
+			{2, "INSERT INTO t VALUES (16, 16, 0)"},
+		},
+		deadlock: false,
+	},
+	{
 		name: "Serializable_ReadThenUpdate", level: lab.Serializable,
 		why: "in SERIALIZABLE a plain SELECT takes S locks; both read, then both try to write\n" +
 			"→ S→X upgrade deadlock (the price of SERIALIZABLE-by-locking)",
@@ -169,6 +220,19 @@ var deadlockCases = []deadlockCase{
 			{2, "UPDATE t SET v = 2 WHERE id = 10"},
 		},
 		deadlock: true,
+	},
+	{
+		name: "RepeatableRead_ReadThenUpdate",
+		why: "the same four statements as Serializable_ReadThenUpdate at REPEATABLE READ: the plain\n" +
+			"SELECTs take no locks, so T2's UPDATE just waits for T1. The isolation level decides\n" +
+			"whether this workload can deadlock",
+		steps: []step{
+			{1, "SELECT v FROM t WHERE id = 10"},
+			{2, "SELECT v FROM t WHERE id = 10"},
+			{1, "UPDATE t SET v = 1 WHERE id = 10"},
+			{2, "UPDATE t SET v = 2 WHERE id = 10"},
+		},
+		deadlock: false,
 	},
 }
 
@@ -208,19 +272,29 @@ func TestDeadlock(t *testing.T) {
 			}
 			L.Settle()
 
-			var victim *lab.Op
+			// Statements still blocked are fine (they wait for a survivor to commit). Of those
+			// that finished, a deadlock fails exactly one, and nothing fails otherwise.
+			var victims []*lab.Op
 			for _, op := range ops {
-				if op.Done() && op.Err != nil && lab.IsDeadlock(op.Err) && !op.Skipped {
-					victim = op
+				switch {
+				case !op.Done() || op.Err == nil || op.Skipped:
+				case lab.IsDeadlock(op.Err):
+					victims = append(victims, op)
+				default:
+					t.Errorf("#%d %s: %q failed with %s", op.Seq, op.S.Name, op.SQL, lab.Describe(op.Err))
 				}
 			}
-			if victim != nil {
-				L.ShowDeadlock(victim)
+			want := 0
+			if c.deadlock {
+				want = 1
+			}
+			if len(victims) != want {
+				t.Errorf("%d deadlock victim(s), want %d", len(victims), want)
+			}
+			if len(victims) > 0 {
+				L.ShowDeadlock(victims[0])
 			} else {
 				L.ShowLocks()
-			}
-			if got := victim != nil; got != c.deadlock {
-				t.Errorf("deadlock = %v, want %v", got, c.deadlock)
 			}
 		})
 	}

@@ -29,7 +29,7 @@ func FreshInnoDBTrx() {
 //	PG: from pg_locks. Type = locktype (relation / tuple / transactionid / advisory ...),
 //	    Object = table name or xid, Mode = AccessShareLock / RowExclusiveLock / ShareLock / ExclusiveLock ...
 //	MySQL: from performance_schema.data_locks. Type = TABLE / RECORD, Object = table.index,
-//	    Mode = IX / X / S / X,GAP / X,REC_NOT_GAP / X,INSERT_INTENTION ..., Data = the locked index key
+//	    Mode = IX / X / S / X,GAP / X,REC_NOT_GAP / X,GAP,INSERT_INTENTION ..., Data = the locked index key
 type Lock struct {
 	Session string
 	Type    string

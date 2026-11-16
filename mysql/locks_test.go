@@ -12,7 +12,7 @@ import (
 //	X,REC_NOT_GAP         record lock: just the index record
 //	X,GAP                 gap lock: the open interval BEFORE the record, not the record
 //	X                     next-key lock: record + the gap before it, i.e. (prev, rec]
-//	X,INSERT_INTENTION    an insert waiting for a gap lock held by someone else
+//	X,GAP,INSERT_INTENTION  an insert waiting for a gap lock held by someone else
 //	"supremum pseudo-record"  the +∞ record of a page; X on it locks the gap to +∞
 //
 // Gap locks never conflict with each other; they only block inserts (insert intention).
@@ -59,7 +59,8 @@ func TestLock_GapLockOnMissingKey(t *testing.T) {
 }
 
 // Range scan on the PK: next-key locks on matching records plus a gap lock on the record
-// that ends the scan. Inserts anywhere in [15, 30) block; beyond 30 they don't.
+// that ends the scan: (10, 20] + (20, 30). Inserts anywhere in (10, 30) block, also below
+// the range's start at 15; 30 itself and beyond are free.
 func TestLock_NextKeyRangeOnPK(t *testing.T) {
 	L := newLab(t)
 	setupT(L)
@@ -132,7 +133,9 @@ func TestLock_NonUniqueSecondaryIndex(t *testing.T) {
 
 // Without a usable index, a locking statement scans the clustered index and, in
 // REPEATABLE READ, locks every row and every gap: effectively a table lock.
-// In READ COMMITTED, InnoDB releases locks on rows that don't match ("semi-consistent read").
+// In READ COMMITTED, InnoDB releases the locks on rows that don't match once the WHERE clause
+// has been evaluated. (The "semi-consistent read", which lets a second UPDATE skip rows that
+// are still locked, is a separate READ COMMITTED feature: TestLock_SemiConsistentReadDocsExample.)
 func TestLock_NoIndexLocksEverything(t *testing.T) {
 	for _, level := range []lab.Level{lab.RepeatableRead, lab.ReadCommitted} {
 		t.Run(level.Short(), func(t *testing.T) {
@@ -145,10 +148,16 @@ func TestLock_NoIndexLocksEverything(t *testing.T) {
 			locks := L.ShowLocks()
 			t2.Begin(level)
 			other := t2.Do("UPDATE t SET v = -2 WHERE id = 30")
-			ins := t2.Do("INSERT INTO t VALUES (40, 40, 40)")
+			// A third session: T2 is busy (blocked) in REPEATABLE READ.
+			ins := L.Session("T3").Do("INSERT INTO t VALUES (40, 40, 40)")
 			if level == lab.RepeatableRead {
-				mustHaveLock(t, locks, "T1", "X", "supremum pseudo-record")
+				for _, rec := range []string{"10", "20", "30", "supremum pseudo-record"} {
+					mustHaveLock(t, locks, "T1", "X", rec)
+				}
 				other.MustBlock()
+				L.Note(`"every row of the table becomes locked, which in turn blocks all inserts by other users"`)
+				ins.MustBlock()
+				L.Session("T4").Do("INSERT INTO t VALUES (15, 15, 15)").MustBlock()
 				t1.Do("ROLLBACK")
 				L.WaitAll()
 				other.MustOK()
@@ -167,17 +176,26 @@ func TestLock_NoIndexLocksEverything(t *testing.T) {
 }
 
 // READ COMMITTED takes no gap locks for searches, so a phantom can be inserted
-// into a range another transaction has "locked".
+// into a range another transaction has "locked". READ UNCOMMITTED otherwise "works like
+// READ COMMITTED" (17.7.2.1): the same.
 func TestLock_RC_NoGapLocks(t *testing.T) {
-	L := newLab(t)
-	setupT(L)
-	t1, t2 := L.Session("T1"), L.Session("T2")
-	t1.Begin(lab.ReadCommitted)
-	t1.Do("SELECT id FROM t WHERE id BETWEEN 10 AND 30 FOR UPDATE").MustRows("(10) (20) (30)")
-	L.ShowLocks()
-	t2.Do("INSERT INTO t VALUES (15, 15, 0)").MustNotBlock().MustOK()
-	t1.Do("SELECT id FROM t WHERE id BETWEEN 10 AND 30 FOR UPDATE").MustRows("(10) (15) (20) (30)")
-	t1.Do("COMMIT")
+	for _, level := range []lab.Level{lab.ReadCommitted, lab.ReadUncommitted} {
+		t.Run(level.Short(), func(t *testing.T) {
+			L := newLab(t)
+			setupT(L)
+			t1, t2 := L.Session("T1"), L.Session("T2")
+			t1.Begin(level)
+			t1.Do("SELECT id FROM t WHERE id BETWEEN 10 AND 30 FOR UPDATE").MustRows("(10) (20) (30)")
+			for _, k := range L.ShowLocks() {
+				if k.Type == "RECORD" && k.Mode != "X,REC_NOT_GAP" {
+					t.Errorf("%s: unexpected %s lock on %s", level, k.Mode, k.Data)
+				}
+			}
+			t2.Do("INSERT INTO t VALUES (15, 15, 0)").MustNotBlock().MustOK()
+			t1.Do("SELECT id FROM t WHERE id BETWEEN 10 AND 30 FOR UPDATE").MustRows("(10) (15) (20) (30)")
+			t1.Do("COMMIT")
+		})
+	}
 }
 
 // FOR SHARE vs FOR UPDATE, NOWAIT and SKIP LOCKED.
@@ -196,7 +214,8 @@ func TestLock_SharedExclusiveNowaitSkipLocked(t *testing.T) {
 }
 
 // Plain SELECT is a non-locking consistent read: it reads the undo version and never waits
-// for row locks. In SERIALIZABLE (with autocommit off) InnoDB turns it into SELECT ... FOR SHARE.
+// for row locks. In SERIALIZABLE, inside a transaction (BEGIN here, or autocommit = 0:
+// TestIso_SER_AutocommitSelectStaysNonLocking), InnoDB turns it into SELECT ... FOR SHARE.
 func TestLock_PlainSelectIsNonLocking(t *testing.T) {
 	for _, level := range []lab.Level{lab.RepeatableRead, lab.Serializable} {
 		t.Run(level.Short(), func(t *testing.T) {

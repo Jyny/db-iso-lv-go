@@ -98,6 +98,23 @@ func dsn(kind Kind, dbname string) string {
 	panic("unknown kind " + kind)
 }
 
+// DSN returns the DSN of database dbname, for experiments that need a connection of their
+// own, outside the shared pool.
+func DSN(kind Kind, dbname string) string { return dsn(kind, dbname) }
+
+// DSNAs returns the DSN of database dbname with the user and password replaced, for
+// experiments that need a connection with fewer privileges.
+func DSNAs(kind Kind, dbname, user, password string) string {
+	d := dsn(kind, dbname)
+	start := 0
+	if kind == Postgres {
+		start = strings.Index(d, "://") + 3
+	}
+	// The credentials end at the LAST '@' before the path: a password may contain '@'.
+	at := start + strings.LastIndex(d[start:start+strings.Index(d[start:], "/")], "@")
+	return d[:start] + user + ":" + password + d[at:]
+}
+
 // withParams appends query parameters to a DSN that may or may not already have some.
 func withParams(dsn, params string) string {
 	if strings.Contains(dsn, "?") {

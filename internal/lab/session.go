@@ -132,8 +132,10 @@ func (s *Session) WaitingForLock() bool {
 	switch s.lab.Kind {
 	case Postgres:
 		// wait_event_type = 'Lock' covers heavyweight locks: relation / tuple / transactionid / advisory ...
+		// SafeSnapshot is a SERIALIZABLE READ ONLY DEFERRABLE transaction waiting for the
+		// concurrent read-write serializable transactions to finish: blocked by them, like a lock.
 		_ = s.lab.Admin.QueryRow(
-			"SELECT coalesce(wait_event_type = 'Lock', false) FROM pg_stat_activity WHERE pid = $1", s.ID,
+			"SELECT coalesce(wait_event_type = 'Lock' OR wait_event = 'SafeSnapshot', false) FROM pg_stat_activity WHERE pid = $1", s.ID,
 		).Scan(&waiting)
 	case MySQL:
 		// InnoDB row-lock waits are in performance_schema.data_lock_waits; MDL / table / user-lock
@@ -211,9 +213,12 @@ func (s *Session) Do(query string, args ...any) *Op {
 			return op
 		default:
 		}
+		// The step's own line goes first: "↳ done" lines pending now were caused by this step
+		// (settle flushed the previous step's), e.g. a blocked UPDATE that makes the DB kill
+		// a deadlock victim and so unblocks a third session.
 		if queuedBehind {
 			op.markDetached(func() {
-				s.lab.printf("%s%s   ⏳ queued behind a blocked statement", s.prefix(op.Seq), op.SQL)
+				s.lab.printStep(s.prefix(op.Seq) + op.SQL + "   ⏳ queued behind a blocked statement")
 			})
 			s.lab.settle()
 			return op
@@ -221,7 +226,7 @@ func (s *Session) Do(query string, args ...any) *Op {
 		if s.isInflight(op) && s.WaitingForLock() {
 			op.Blocked = true
 			if op.markDetached(func() {
-				s.lab.printf("%s%s   ⏳ BLOCKED (waiting for lock)", s.prefix(op.Seq), op.SQL)
+				s.lab.printStep(s.prefix(op.Seq) + op.SQL + "   ⏳ BLOCKED (waiting for lock)")
 			}) {
 				s.lab.settle()
 				return op
@@ -231,7 +236,7 @@ func (s *Session) Do(query string, args ...any) *Op {
 		}
 		if time.Now().After(deadline) {
 			op.markDetached(func() {
-				s.lab.printf("%s%s   … still running after %v", s.prefix(op.Seq), op.SQL, stepTimeout)
+				s.lab.printStep(fmt.Sprintf("%s%s   … still running after %v", s.prefix(op.Seq), op.SQL, stepTimeout))
 			})
 			return op
 		}
@@ -301,8 +306,28 @@ func isTxStart(q string) bool {
 
 func isTxEnd(q string) bool {
 	u := strings.ToUpper(strings.TrimSpace(q))
+	f := strings.Fields(u)
 	return strings.HasPrefix(u, "COMMIT") || strings.HasPrefix(u, "ABORT") ||
-		strings.HasPrefix(u, "ROLLBACK") && !isRollbackToSavepoint(q)
+		strings.HasPrefix(u, "ROLLBACK") && !isRollbackToSavepoint(q) ||
+		len(f) > 0 && strings.TrimSuffix(f[0], ";") == "END" || // PG: END = COMMIT
+		strings.HasPrefix(u, "PREPARE TRANSACTION") // PG: the session leaves the transaction
+}
+
+// commitsImplicitly reports whether MySQL commits the open transaction before running q
+// (DDL and LOCK TABLES), which it does even when q then fails.
+// https://dev.mysql.com/doc/refman/8.4/en/implicit-commit.html
+func commitsImplicitly(q string) bool {
+	f := strings.Fields(strings.ToUpper(q))
+	if len(f) < 2 || f[1] == "TEMPORARY" {
+		return false
+	}
+	switch f[0] {
+	case "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME":
+		return true
+	case "LOCK":
+		return f[1] == "TABLES" || f[1] == "TABLE"
+	}
+	return false
 }
 
 // isRollbackToSavepoint matches ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name,
@@ -352,9 +377,10 @@ func (s *Session) run(op *Op) {
 			s.mu.Unlock()
 			op.Skipped, op.Err = true, abortErr
 			return
-		case s.lab.Kind == MySQL && (isTxStart(op.SQL) || isSetTransaction(op.SQL)):
+		case s.lab.Kind == MySQL && (isTxStart(op.SQL) || isSetTransaction(op.SQL) || commitsImplicitly(op.SQL)):
 			// On MySQL the aborted transaction is already gone, so the application starting
-			// its retry (SET TRANSACTION / START TRANSACTION) begins a fresh one; run it.
+			// its retry (SET TRANSACTION / START TRANSACTION) begins a fresh one, and a
+			// statement that commits implicitly runs outside it anyway; run them.
 			// (On PG the session stays in the aborted transaction until ROLLBACK.)
 			s.mu.Lock()
 			s.abortErr, s.inTx = nil, false
@@ -387,7 +413,7 @@ func (s *Session) run(op *Op) {
 	switch {
 	case isTxStart(op.SQL) && op.Err == nil:
 		s.inTx = true
-	case isTxEnd(op.SQL):
+	case isTxEnd(op.SQL), s.lab.Kind == MySQL && commitsImplicitly(op.SQL):
 		s.inTx = false
 	case isRollbackToSavepoint(op.SQL) && op.Err == nil:
 		s.abortErr = nil
@@ -558,6 +584,11 @@ func (op *Op) MustFail(match func(error) bool) *Op {
 	op.Wait()
 	if op.Err == nil {
 		t.Fatalf("#%d %s: %q expected to fail, but succeeded%s", op.Seq, op.S.Name, op.SQL, op.resultSuffix())
+	}
+	// A skipped op only carries the error that aborted its transaction; it never ran.
+	if op.Skipped {
+		t.Fatalf("#%d %s: %q expected to fail, but it was not run: the transaction was already aborted by %s",
+			op.Seq, op.S.Name, op.SQL, Describe(op.Err))
 	}
 	if match != nil && !match(op.Err) {
 		t.Fatalf("#%d %s: %q unexpected error: %s", op.Seq, op.S.Name, op.SQL, Describe(op.Err))

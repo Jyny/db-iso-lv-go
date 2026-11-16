@@ -1,7 +1,9 @@
 package lab
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 )
@@ -168,5 +170,97 @@ func TestQuietDropsUnblockMessages(t *testing.T) {
 	L.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("%d message(s) from the quiet period still pending", n)
+	}
+}
+
+// captureTB sends the timeline to a buffer.
+type captureTB struct {
+	testing.TB
+	out *bytes.Buffer
+}
+
+func (c captureTB) Output() io.Writer { return c.out }
+
+// A statement that blocks and, by closing a deadlock, unblocks other sessions must be printed
+// before their "↳ done" lines. They used to come first, as if they had happened before it.
+// The interleaving is Hermitage's MySQL serializable example by Fekete et al.
+func TestBlockedStepPrintedBeforeWhatItUnblocks(t *testing.T) {
+	var out bytes.Buffer
+	L := New(captureTB{t, &out}, MySQL, testDB)
+	L.Exec("DROP TABLE IF EXISTS fk", "CREATE TABLE fk (id int primary key, v int)", "INSERT INTO fk VALUES (1, 10), (2, 20)")
+	t1, t2, t3 := L.Session("T1"), L.Session("T2"), L.Session("T3")
+	t1.Begin(Serializable)
+	t1.Do("SELECT * FROM fk")
+	t2.Begin(Serializable)
+	t2.Do("UPDATE fk SET v = v + 5 WHERE id = 2").MustBlock()
+	t3.Begin(Serializable)
+	t3.Do("SELECT * FROM fk").MustBlock()
+	// T1 waits for T3's S lock: T1 → T3 → T2 → T1, T2 is the victim, T3 can read.
+	t1.Do("UPDATE fk SET v = 0 WHERE id = 1").MustBlock()
+	t3.Do("COMMIT")
+	t1.Do("COMMIT")
+	L.WaitAll()
+
+	s := out.String()
+	upd := strings.Index(s, "UPDATE fk SET v = 0 WHERE id = 1   ⏳ BLOCKED")
+	if upd < 0 {
+		t.Fatalf("T1's UPDATE is not on the timeline:\n%s", s)
+	}
+	for _, unblocked := range []string{"T2 │ ↳", "T3 │ ↳"} {
+		if i := strings.Index(s, unblocked); i < 0 || i < upd {
+			t.Errorf("%q is not printed after T1's UPDATE that caused it:\n%s", unblocked, s)
+		}
+	}
+}
+
+func TestDSNAs(t *testing.T) {
+	t.Setenv("LAB_PG_DSN", "postgres://postgres:lab@h:1/%s?sslmode=disable")
+	t.Setenv("LAB_MYSQL_DSN", "root:lab@tcp(h:1)/%s")
+	if got, want := DSNAs(Postgres, "x", "u", "p"), "postgres://u:p@h:1/x?sslmode=disable&default_query_exec_mode=simple_protocol"; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+	if got, want := DSNAs(MySQL, "x", "u", "p"), "u:p@tcp(h:1)/x?interpolateParams=true&parseTime=true"; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+	t.Setenv("LAB_MYSQL_DSN", "root:p@ss@tcp(h:1)/%s")
+	if got, want := DSNAs(MySQL, "x", "u", "p"), "u:p@tcp(h:1)/x?interpolateParams=true&parseTime=true"; got != want {
+		t.Errorf("password with '@': got %s, want %s", got, want)
+	}
+}
+
+// PG's END is COMMIT. Missing it left the session "in a transaction", so a later autocommit
+// error put it in skip mode and the statements after it were silently not run.
+func TestPGEndEndsTx(t *testing.T) {
+	L := New(t, Postgres, testDB)
+	s := L.Session("T1")
+	s.Do("BEGIN")
+	s.Do("SELECT 1")
+	s.Do("END").MustOK()
+	s.Do("SELECT 1/0").MustFail(nil)
+	if op := s.Do("SELECT 1").MustOK(); op.Skipped {
+		t.Fatal("statement after an autocommit error was skipped")
+	}
+}
+
+// MySQL commits implicitly before DDL and LOCK TABLES, even if the statement then fails.
+func TestMySQLImplicitCommitEndsTx(t *testing.T) {
+	L := New(t, MySQL, testDB)
+	L.Exec("DROP TABLE IF EXISTS ic", "CREATE TABLE ic (id int primary key)")
+	s := L.Session("T1")
+	for _, q := range []string{"CREATE TABLE IF NOT EXISTS ic (id int primary key)", "ALTER TABLE nosuch ADD c int", "LOCK TABLES ic READ"} {
+		s.Do("START TRANSACTION")
+		s.Do("INSERT INTO ic VALUES (1)")
+		s.Do(q)
+		s.Do("UNLOCK TABLES")
+		s.mu.Lock()
+		inTx := s.inTx
+		s.mu.Unlock()
+		if inTx {
+			t.Errorf("%q: session still considered in a transaction after an implicit commit", q)
+		}
+		if n := L.QueryString("SELECT count(*) FROM ic"); n != "1" {
+			t.Fatalf("%q: the INSERT was not committed (count %s)", q, n)
+		}
+		L.Exec("DELETE FROM ic")
 	}
 }

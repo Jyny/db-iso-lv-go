@@ -6,25 +6,26 @@ import (
 	"github.com/jyny/db-iso-lv-go/internal/lab"
 )
 
-// READ COMMITTED re-checks the WHERE clause on the newest row version after waiting
-// ("EvalPlanQual"), but only for rows its own snapshot found. Straight from the docs:
+// READ COMMITTED re-checks the WHERE clause on the newest version of a row that changed
+// after the statement's snapshot ("EvalPlanQual"; it first waits if the writer is still in
+// progress), but only for rows its own snapshot found. The docs' example, statement for
+// statement, on "a two-row table with website.hits equaling 9 and 10":
 // https://www.postgresql.org/docs/18/transaction-iso.html#XACT-READ-COMMITTED
 func TestIso_RC_EvalPlanQualDocsExample(t *testing.T) {
 	L := newLab(t)
-	L.Exec("DROP TABLE IF EXISTS website", "CREATE TABLE website (id int primary key, hits int)",
-		"INSERT INTO website VALUES (1, 9), (2, 10)")
+	L.Exec("DROP TABLE IF EXISTS website", "CREATE TABLE website (hits int)",
+		"INSERT INTO website VALUES (9), (10)")
 	t1, t2 := L.Session("T1"), L.Session("T2")
 
 	t1.Do("BEGIN")
 	t1.Do("UPDATE website SET hits = hits + 1")
-	t2.Do("BEGIN")
+	L.Note("-- run from another session:")
 	del := t2.Do("DELETE FROM website WHERE hits = 10").MustBlock()
 	t1.Do("COMMIT")
-	L.Note("T2's snapshot only matched id=2 (hits=10). After waiting it re-checks id=2 → now 11 → skipped.\n" +
-		"id=1 now has hits=10, but T2's snapshot saw 9, so it is never considered. 0 rows deleted.")
+	L.Note("T2's snapshot only matched the row with hits = 10. After waiting it re-checks that row → now 11 → skipped.\n" +
+		"The other row now has hits = 10, but T2's snapshot saw 9, so it is never considered. 0 rows deleted.")
 	del.MustAffect(0)
-	t2.Do("COMMIT")
-	t2.Do("SELECT * FROM website ORDER BY id").MustRows("(1,10) (2,11)")
+	t2.Do("SELECT * FROM website ORDER BY hits").MustRows("(10) (11)")
 }
 
 // In READ COMMITTED, "SET v = v + 1" is safe: the UPDATE waits, then re-reads the newest
@@ -165,6 +166,11 @@ SELECT a.application_name, l.locktype, l.relation::regclass, l.page, l.tuple
 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
 WHERE l.mode = 'SIReadLock' AND a.application_name LIKE 'lab:%' AND l.locktype = 'relation'
 ORDER BY 1, 2, 3`)
+			// 13.2.3: "A sequential scan will always necessitate a relation-level predicate lock."
+			heapLocks := L.QueryString("SELECT count(*) FROM pg_locks WHERE mode = 'SIReadLock' AND locktype = 'relation' AND relation = 'ledger'::regclass")
+			if want := map[bool]string{false: "2", true: "0"}[useIndex]; heapLocks != want {
+				t.Fatalf("relation-level SIRead locks on ledger: %s, want %s", heapLocks, want)
+			}
 			t1.Do("INSERT INTO ledger (grp, amount) VALUES (1, 10)")
 			t2.Do("INSERT INTO ledger (grp, amount) VALUES (3, 10)")
 			t1.Do("COMMIT").MustOK()
