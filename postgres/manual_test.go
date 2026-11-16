@@ -70,9 +70,9 @@ func TestIso_RC_EachStatementTakesNewSnapshot(t *testing.T) {
 	t1.Do("COMMIT")
 }
 
-// 13.2.1: an UPDATE that waited for a concurrent writer decides what to do from that writer's
-// outcome: rollback → proceed with the original row; committed DELETE → skip the row;
-// committed UPDATE → re-check WHERE against the new version.
+// 13.2.1: an UPDATE or DELETE that waited for a concurrent writer decides what to do from
+// that writer's outcome: rollback → proceed with the original row; committed DELETE → skip
+// the row; committed UPDATE → re-check WHERE against the new version.
 func TestIso_RC_WaitThenRecheck(t *testing.T) {
 	cases := []struct {
 		name, first, end string
@@ -84,23 +84,32 @@ func TestIso_RC_WaitThenRecheck(t *testing.T) {
 		{"committed-update-still-matches", "UPDATE r SET v = 5 WHERE id = 1", "COMMIT", 1, "(105)"},
 		{"committed-update-no-longer-matches", "UPDATE r SET v = 50 WHERE id = 1", "COMMIT", 0, "(50)"},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			L := newLab(t)
-			setupRows(L)
-			t1, t2 := L.Session("T1"), L.Session("T2")
-			t1.Do("BEGIN")
-			t1.Do(c.first)
-			upd := t2.Do("UPDATE r SET v = v + 100 WHERE id = 1 AND v < 10").MustBlock()
-			t1.Do(c.end)
-			upd.MustAffect(c.affected)
-			t2.Do("SELECT v FROM r WHERE id = 1").MustRows(c.final)
-		})
+	for _, verb := range []string{"UPDATE", "DELETE"} {
+		for _, c := range cases {
+			t.Run(verb+"/"+c.name, func(t *testing.T) {
+				stmt, final := "UPDATE r SET v = v + 100 WHERE id = 1 AND v < 10", c.final
+				if verb == "DELETE" {
+					stmt = "DELETE FROM r WHERE id = 1 AND v < 10"
+					if c.affected == 1 {
+						final = "(no rows)"
+					}
+				}
+				L := newLab(t)
+				setupRows(L)
+				t1, t2 := L.Session("T1"), L.Session("T2")
+				t1.Do("BEGIN")
+				t1.Do(c.first)
+				w := t2.Do(stmt).MustBlock()
+				t1.Do(c.end)
+				w.MustAffect(c.affected)
+				t2.Do("SELECT v FROM r WHERE id = 1").MustRows(final)
+			})
+		}
 	}
 }
 
 // 13.2.1: INSERT ... ON CONFLICT DO UPDATE always ends in an insert or an update, even when
-// the conflicting row is uncommitted when it starts; DO NOTHING skips it. "The UPDATE clause
+// the conflicting row is uncommitted when it starts; DO NOTHING skips it. "[T]he UPDATE clause
 // will affect that row, even though possibly no version of that row is conventionally
 // visible to the command": the RETURNING subquery runs on the statement's snapshot, taken
 // before T1 committed, and still counts an empty table.
@@ -123,6 +132,19 @@ func TestIso_RC_InsertOnConflict(t *testing.T) {
 	t1.Do("COMMIT")
 	skip.MustAffect(0)
 	t2.Do("SELECT v FROM kv WHERE k = 2").MustRows("(t1)")
+
+	L.Note(`"each row proposed for insertion will either insert or update": if T1 rolls back, the insert path`)
+	t1.Do("BEGIN")
+	t1.Do("INSERT INTO kv VALUES (3, 't1')")
+	up = t2.Do("INSERT INTO kv VALUES (3, 't2') ON CONFLICT (k) DO UPDATE SET v = excluded.v || '-upd' RETURNING v").MustBlock()
+	t1.Do("ROLLBACK")
+	up.MustRows("(t2)")
+	t1.Do("BEGIN")
+	t1.Do("INSERT INTO kv VALUES (4, 't1')")
+	skip = t2.Do("INSERT INTO kv VALUES (4, 't2') ON CONFLICT DO NOTHING").MustBlock()
+	t1.Do("ROLLBACK")
+	skip.MustAffect(1)
+	t2.Do("SELECT v FROM kv WHERE k = 4").MustRows("(t2)")
 }
 
 // 13.2.1: MERGE gives no such guarantee. Its WHEN NOT MATCHED branch was chosen from the
@@ -247,7 +269,29 @@ func TestIso_RR_ConcurrentChangeOutcomes(t *testing.T) {
 // 13.2.3: the docs' mytab example. Each transaction sums one class and inserts into the other.
 // Every serial order would make one of them see the other's insert, so SERIALIZABLE fails one
 // commit. REPEATABLE READ commits both. SIRead predicate locks never block.
+// "If either transaction were running at the Repeatable Read isolation level, both would be
+// allowed to commit": the mixed subtests run one side at each level.
 func TestIso_SER_MytabDocsExample(t *testing.T) {
+	for _, c := range []struct{ a, b lab.Level }{
+		{lab.Serializable, lab.RepeatableRead}, {lab.RepeatableRead, lab.Serializable},
+	} {
+		t.Run("A="+c.a.Short()+",B="+c.b.Short(), func(t *testing.T) {
+			L := newLab(t)
+			L.Exec("DROP TABLE IF EXISTS mytab", "CREATE TABLE mytab (class int, value int)",
+				"INSERT INTO mytab VALUES (1, 10), (1, 20), (2, 100), (2, 200)")
+			a, b := L.Session("A"), L.Session("B")
+			a.Begin(c.a)
+			b.Begin(c.b)
+			a.Do("SELECT SUM(value) FROM mytab WHERE class = 1").MustRows("(30)")
+			b.Do("SELECT SUM(value) FROM mytab WHERE class = 2").MustRows("(300)")
+			a.Do("INSERT INTO mytab VALUES (2, 30)").MustNotBlock()
+			b.Do("INSERT INTO mytab VALUES (1, 300)").MustNotBlock()
+			a.Do("COMMIT").MustOK()
+			b.Do("COMMIT").MustOK()
+			a.Do("SELECT class, value FROM mytab ORDER BY class, value").
+				MustRows("(1,10) (1,20) (1,300) (2,30) (2,100) (2,200)")
+		})
+	}
 	for _, level := range []lab.Level{lab.RepeatableRead, lab.Serializable} {
 		t.Run(level.Short(), func(t *testing.T) {
 			L := newLab(t)
@@ -289,9 +333,17 @@ func TestIso_SER_ReadOnlyDeferrable(t *testing.T) {
 	ro.Do("SELECT sum(v) FROM r").MustNotBlock().MustRows("(0)")
 	ro.Do("COMMIT")
 
+	L.Note("DEFERRABLE has no effect at REPEATABLE READ: no wait")
+	ro.Do("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY DEFERRABLE")
+	ro.Do("SELECT sum(v) FROM r").MustNotBlock().MustRows("(0)")
+	ro.Do("COMMIT")
+
 	ro.Do("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE")
 	sel := ro.Do("SELECT sum(v) FROM r").MustBlock()
-	L.ShowAs("pg_stat_activity", "SELECT application_name, wait_event_type, wait_event FROM pg_stat_activity WHERE application_name = 'lab:RO'")
+	wait := L.ShowAs("pg_stat_activity", "SELECT application_name, wait_event_type, wait_event FROM pg_stat_activity WHERE application_name = 'lab:RO'")
+	if got := lab.FormatRows(wait); got != "(lab:RO,IPC,SafeSnapshot)" {
+		t.Errorf("the deferrable transaction waits as %s, want (lab:RO,IPC,SafeSnapshot)", got)
+	}
 	rw.Do("COMMIT")
 	sel.MustRows("(0)")
 	ro.Do("COMMIT")
@@ -774,6 +826,28 @@ func TestLock_AdvisorySemantics(t *testing.T) {
 	t1.Do("SELECT pg_advisory_unlock(4)")
 	x.MustOK()
 	t2.Do("COMMIT")
+
+	L.Note(`"regardless of whether the existing lock hold and new request are at session level or
+transaction level": now the hold is transaction-level and the new request session-level`)
+	t1.Do("BEGIN")
+	t1.Do("SELECT pg_advisory_xact_lock(5)")
+	y := t2.Do("SELECT pg_advisory_lock(5)").MustBlock()
+	t1.Do("SELECT pg_advisory_lock(5)").MustNotBlock().MustOK()
+	t1.Do("COMMIT")
+	L.Note("COMMIT ended only the transaction-level hold; the session-level one still keeps T2 waiting")
+	L.Settle()
+	y.MustBlock()
+	t1.Do("SELECT pg_advisory_unlock(5)").MustRows("(true)")
+	y.MustOK()
+	t2.Do("SELECT pg_advisory_unlock(5)").MustRows("(true)")
+
+	L.Note("a transaction-level lock is released by ROLLBACK as well")
+	t1.Do("BEGIN")
+	t1.Do("SELECT pg_advisory_xact_lock(6)")
+	t1.Do("ROLLBACK")
+	if !free(6) {
+		t.Fatal("transaction-level lock outlived ROLLBACK")
+	}
 }
 
 // 13.3.5: a locking function must only run on the rows you mean to lock. The docs give three
@@ -781,11 +855,12 @@ func TestLock_AdvisorySemantics(t *testing.T) {
 // function is executed") and "ok" (LIMIT in a subquery). They run here verbatim, on a foo
 // with ids 12301..13300.
 //
-// PG 18 does apply the LIMIT first: a volatile function in the SELECT list is evaluated
-// after LIMIT, and after ORDER BY ... LIMIT too, so the "danger!" query locks only its 100
-// rows. The danger is real with the function in WHERE: there it runs for every row the scan
-// visits, before ORDER BY ... LIMIT picks one. That is the classic job-queue bug, and the
-// locks on the other 954 rows stay until the session ends.
+// "Not guaranteed" is the point. On PG 18 the docs' exact "danger!" query happens to lock
+// just its 100 rows: Limit stops pulling rows from the scan, and with a sort the SELECT list
+// is evaluated above it. But the same SELECT-list call with an OFFSET locks the 10 skipped
+// rows too, and with the function in WHERE it runs for every row the scan visits, before
+// ORDER BY ... LIMIT picks one. That is the classic job-queue bug, and the locks on the
+// other 954 rows stay until the session ends.
 func TestLock_AdvisoryLockFilterPitfall(t *testing.T) {
 	L := newLab(t)
 	L.Exec("DROP TABLE IF EXISTS foo", "CREATE TABLE foo (id int primary key, prio int)",
@@ -799,6 +874,7 @@ func TestLock_AdvisoryLockFilterPitfall(t *testing.T) {
 		{"docs: danger!", "SELECT pg_advisory_lock(id) FROM foo WHERE id > 12345 LIMIT 100", 100},
 		{"docs: ok", "SELECT pg_advisory_lock(q.id) FROM (SELECT id FROM foo WHERE id > 12345 LIMIT 100) q", 100},
 		{"with a sort before the LIMIT", "SELECT pg_advisory_lock(id) FROM foo WHERE id > 12345 ORDER BY prio DESC LIMIT 100", 100},
+		{"with an OFFSET", "SELECT pg_advisory_lock(id) FROM foo WHERE id > 12345 OFFSET 10 LIMIT 100", 110},
 		{"lock in WHERE", "SELECT id FROM foo WHERE id > 12345 AND pg_try_advisory_lock(id) ORDER BY prio LIMIT 1", 955},
 		{"lock in WHERE, LIMIT first", "SELECT q.id FROM (SELECT id FROM foo WHERE id > 12345 ORDER BY prio LIMIT 1) q WHERE pg_try_advisory_lock(q.id)", 1},
 	} {
@@ -902,7 +978,8 @@ func TestIso_SumCheckAcrossTwoTables(t *testing.T) {
 }
 
 // 13.5: an exclusion-constraint conflict (23P01) behaves like a unique one: the second
-// inserter waits for the first transaction's outcome.
+// inserter waits for the first transaction's outcome. Such an error "might represent
+// persistent error conditions": unlike a 40001, retrying the same INSERT fails again.
 func TestLock_ExclusionConstraintWaitsForOutcome(t *testing.T) {
 	L := newLab(t)
 	L.Exec("DROP TABLE IF EXISTS booking", "CREATE TABLE booking (room int, during int4range, EXCLUDE USING gist (during WITH &&))")
@@ -912,6 +989,8 @@ func TestLock_ExclusionConstraintWaitsForOutcome(t *testing.T) {
 	ins := t2.Do("INSERT INTO booking VALUES (1, '[3,8)')").MustBlock()
 	t1.Do("COMMIT")
 	ins.MustFail(func(err error) bool { return lab.Code(err) == "23P01" })
+	L.Note("retried unchanged, it fails the same way; only a different range goes in")
+	t2.Do("INSERT INTO booking VALUES (1, '[3,8)')").MustFail(func(err error) bool { return lab.Code(err) == "23P01" })
 	t2.Do("INSERT INTO booking VALUES (1, '[5,8)')").MustOK()
 }
 
@@ -937,8 +1016,8 @@ func TestMVCC_TruncateIsNotMVCCSafe(t *testing.T) {
 		})
 	}
 	t.Run("inconsistent-with-other-tables", func(t *testing.T) {
-		// "an apparent inconsistency between the contents of the truncated table and other
-		// tables in the database": one transaction empties both big5 and its mirror, so the
+		// "they could cause visible inconsistency between the contents of the target table
+		// and other tables in the database": one transaction empties both big5 and its mirror, so the
 		// only committed states are (5,5) and (0,0); the old snapshot sees (0,5).
 		L := newLab(t)
 		L.Exec("DROP TABLE IF EXISTS big5, mirror5", "CREATE TABLE big5 (v int)", "INSERT INTO big5 SELECT generate_series(1, 5)",
@@ -1036,7 +1115,7 @@ FROM (SELECT pg_advisory_xact_lock(7) AS x OFFSET 0) l`).MustBlock()
 
 // 13.2.1: a waiting UPDATE "will only find target rows that were committed as of the command
 // start time". Once unblocked it re-checks the row it waited for, but does not look for new
-// ones: the matching row T1 inserted is left alone. "Subsequent commands in the same
+// ones: the matching row T1 inserted is left alone. "[S]ubsequent commands in the same
 // transaction will see the effects of the committed concurrent transaction in any case."
 func TestIso_RC_WaitDoesNotFindNewRows(t *testing.T) {
 	L := newLab(t)
@@ -1063,6 +1142,7 @@ func TestIso_RC_LockingReadReturnsUpdatedRow(t *testing.T) {
 			{"updated", "UPDATE r SET v = 5 WHERE id = 1", "(5)"},
 			{"no-longer-matches", "UPDATE r SET v = 50 WHERE id = 1", "(no rows)"},
 			{"deleted", "DELETE FROM r WHERE id = 1", "(no rows)"},
+			{"rolled-back", "UPDATE r SET v = 5 WHERE id = 1", "(0)"},
 		} {
 			t.Run(strings.ReplaceAll(mode, " ", "-")+"/"+c.name, func(t *testing.T) {
 				L := newLab(t)
@@ -1072,15 +1152,26 @@ func TestIso_RC_LockingReadReturnsUpdatedRow(t *testing.T) {
 				t1.Do(c.first)
 				t2.Do("BEGIN")
 				sel := t2.Do("SELECT v FROM r WHERE id = 1 AND v < 10 " + mode).MustBlock()
-				t1.Do("COMMIT")
+				if c.name == "rolled-back" {
+					t1.Do("ROLLBACK")
+				} else {
+					t1.Do("COMMIT")
+				}
 				sel.MustRows(c.want)
+				if c.name == "updated" {
+					// "it is the updated version of the row that is locked and returned"
+					if n := L.QueryString("SELECT count(*) FROM pgrowlocks('r') p JOIN r ON r.ctid = p.locked_row WHERE r.id = 1"); n != "1" {
+						t.Errorf("the new row version carries %s row locks, want 1", n)
+					}
+					t1.Do("SELECT 1 FROM r WHERE id = 1 FOR UPDATE NOWAIT").MustFail(lab.IsLockNotAvailable)
+				}
 				t2.Do("COMMIT")
 			})
 		}
 	}
 }
 
-// 13.2.1: the ON CONFLICT guarantees hold "only in Read Committed mode". In REPEATABLE READ
+// 13.2.1: the ON CONFLICT guarantees hold in READ COMMITTED alone ("this is only the case in Read Committed mode"). In REPEATABLE READ
 // a conflict with a row the snapshot cannot see is a serialization failure, for DO UPDATE
 // and DO NOTHING alike.
 func TestIso_RR_InsertOnConflictFails(t *testing.T) {
@@ -1148,8 +1239,9 @@ func TestIso_RR_SeesOwnChanges(t *testing.T) {
 
 // 13.2.3: SIRead predicate locks cover what was actually read, and fine-grained locks are
 // combined into coarser ones: more than max_pred_locks_per_page tuple locks on one page
-// become a page lock, and more than max_pred_locks_per_relation page or tuple locks on one
-// relation become a relation lock.
+// become a page lock, and when the page and tuple locks on one relation reach the
+// max_pred_locks_per_relation threshold (the default -2 means max_pred_locks_per_transaction
+// / 2 = 32: the 32nd lock promotes) they become a relation lock.
 func TestIso_SER_PredicateLockPromotion(t *testing.T) {
 	L := newLab(t)
 	L.Exec("DROP TABLE IF EXISTS pl", "CREATE TABLE pl (id int primary key, pad text)",
@@ -1180,7 +1272,7 @@ func TestIso_SER_PredicateLockPromotion(t *testing.T) {
 	L.Note("a third tuple on the same page exceeds max_pred_locks_per_page = 2")
 	s.Do("SELECT length(pad) FROM pl WHERE id = 3")
 	expect("page x1")
-	L.Note("one row from each of many other pages exceeds max_pred_locks_per_relation (64 / 2 = 32)")
+	L.Note("one row from each of 40 other pages passes the max_pred_locks_per_relation threshold (64 / 2 = 32)")
 	s.Do("SELECT count(pad) FROM pl WHERE id = ANY (SELECT g * 40 FROM generate_series(1, 40) g)")
 	expect("relation x1")
 	s.Do("COMMIT")
@@ -1292,6 +1384,25 @@ func TestLock_TableLockRequestedByNonTransactionalCommands(t *testing.T) {
 			op.MustOK()
 		})
 	}
+	// The lookup itself: behind an ACCESS EXCLUSIVE lock, the first thing VACUUM and
+	// VACUUM FULL wait for is ACCESS SHARE, not the mode the docs list for them.
+	for _, sql := range []string{"VACUUM tl", "VACUUM FULL tl"} {
+		t.Run(strings.ReplaceAll(sql, " ", "_")+"/lookup", func(t *testing.T) {
+			L := newLab(t)
+			L.Exec("DROP TABLE IF EXISTS tl2", "DROP TABLE IF EXISTS tl CASCADE",
+				"CREATE TABLE tl (id int primary key, v int)", "INSERT INTO tl VALUES (1, 0)")
+			t1, t2 := L.Session("T1"), L.Session("T2")
+			t1.Do("BEGIN")
+			t1.Do("LOCK TABLE tl IN ACCESS EXCLUSIVE MODE")
+			op := t2.Do(sql).MustBlock()
+			got := L.QueryString("SELECT mode FROM pg_locks WHERE pid = $1 AND NOT granted AND relation = 'tl'::regclass", t2.ID)
+			if got != "AccessShareLock" {
+				t.Errorf("%s first waits for %s, want AccessShareLock", sql, got)
+			}
+			t1.Do("ROLLBACK")
+			op.MustOK()
+		})
+	}
 }
 
 // 13.3.1: an error that escapes a PL/pgSQL exception block releases the locks taken inside
@@ -1328,9 +1439,9 @@ func TestLock_AdvisoryReleasedAtSessionEnd(t *testing.T) {
 	t2.Do("SELECT pg_advisory_unlock(9)")
 }
 
-// 13.3.2: what each shared row lock stops other transactions' writes from doing.
-// FOR KEY SHARE blocks DELETE and an UPDATE that changes the key, but not other UPDATEs;
-// FOR SHARE blocks every UPDATE and DELETE.
+// 13.3.2: what each row lock taken by a locking SELECT stops other transactions' writes
+// from doing. FOR KEY SHARE blocks DELETE and an UPDATE that changes the key, but not other
+// UPDATEs; FOR SHARE, FOR NO KEY UPDATE and FOR UPDATE block every UPDATE and DELETE.
 func TestLock_SharedRowLocksBlockWriters(t *testing.T) {
 	for _, c := range []struct {
 		mode, write string
@@ -1341,6 +1452,10 @@ func TestLock_SharedRowLocksBlockWriters(t *testing.T) {
 		{"FOR KEY SHARE", "DELETE FROM r WHERE id = 1", true},
 		{"FOR SHARE", "UPDATE r SET v = 1 WHERE id = 1", true},
 		{"FOR SHARE", "DELETE FROM r WHERE id = 1", true},
+		{"FOR NO KEY UPDATE", "UPDATE r SET v = 1 WHERE id = 1", true},
+		{"FOR NO KEY UPDATE", "DELETE FROM r WHERE id = 1", true},
+		{"FOR UPDATE", "UPDATE r SET v = 1 WHERE id = 1", true},
+		{"FOR UPDATE", "DELETE FROM r WHERE id = 1", true},
 	} {
 		t.Run(strings.ReplaceAll(c.mode+"/"+strings.Join(strings.Fields(c.write)[:4], " "), " ", "-"), func(t *testing.T) {
 			L := newLab(t)
@@ -1417,4 +1532,433 @@ func TestTx_PreparedTransactionBlocksRetries(t *testing.T) {
 		op.MustOK()
 	}
 	t2.Do("SELECT id, v FROM r ORDER BY id").MustRows("(1,11) (2,1)")
+
+	L.Note(`"...or rolls back": ROLLBACK PREPARED frees a waiting writer just the same`)
+	t1.Do("BEGIN")
+	t1.Do("UPDATE r SET v = 0 WHERE id = 1")
+	t1.Do("PREPARE TRANSACTION '" + gid + "'").MustOK()
+	upd = w.Do("UPDATE r SET v = v + 10 WHERE id = 1").MustBlock()
+	t1.Do("ROLLBACK PREPARED '" + gid + "'").MustOK()
+	upd.MustAffect(1)
+	t2.Do("SELECT v FROM r WHERE id = 1").MustRows("(21)")
+}
+
+// 13.2, Table 13.1, by the docs' own definitions of the four phenomena, at each of the four
+// levels that can be requested. READ UNCOMMITTED is accepted and behaves like READ COMMITTED;
+// REPEATABLE READ allows no phantoms ("Allowed, but not in PG").
+func TestIso_Table13_1(t *testing.T) {
+	for _, c := range []struct {
+		level                           lab.Level
+		nonrepeatable, phantom, anomaly bool
+	}{
+		{lab.ReadUncommitted, true, true, true},
+		{lab.ReadCommitted, true, true, true},
+		{lab.RepeatableRead, false, false, true},
+		{lab.Serializable, false, false, false},
+	} {
+		t.Run(c.level.Short(), func(t *testing.T) {
+			L := newLab(t)
+			L.Exec("DROP TABLE IF EXISTS t131", "CREATE TABLE t131 (id int primary key, v int)",
+				"INSERT INTO t131 VALUES (1, 10), (2, 20)")
+			t1, t2 := L.Session("T1"), L.Session("T2")
+			pick := func(occurs bool, yes, no string) string {
+				if occurs {
+					return yes
+				}
+				return no
+			}
+
+			L.Note("dirty read: reading data written by a concurrent uncommitted transaction. Not possible at any level")
+			t2.Do("BEGIN")
+			t2.Do("UPDATE t131 SET v = 99 WHERE id = 1")
+			t1.Begin(c.level)
+			t1.Do("SHOW transaction_isolation").MustRows("(" + strings.ToLower(string(c.level)) + ")")
+			t1.Do("SELECT v FROM t131 WHERE id = 1").MustNotBlock().MustRows("(10)")
+			t1.Do("COMMIT")
+			t2.Do("ROLLBACK")
+
+			L.Note("nonrepeatable read: re-reading a row finds it modified by a transaction that committed since the first read")
+			t1.Begin(c.level)
+			t1.Do("SELECT v FROM t131 WHERE id = 1").MustRows("(10)")
+			t2.Do("UPDATE t131 SET v = 11 WHERE id = 1")
+			t1.Do("SELECT v FROM t131 WHERE id = 1").MustRows(pick(c.nonrepeatable, "(11)", "(10)"))
+			t1.Do("COMMIT")
+
+			L.Note("phantom read: re-executing a query finds that the set of rows satisfying its condition has changed")
+			t1.Begin(c.level)
+			t1.Do("SELECT count(*) FROM t131 WHERE v >= 10").MustRows("(2)")
+			t2.Do("INSERT INTO t131 VALUES (3, 30)")
+			t1.Do("SELECT count(*) FROM t131 WHERE v >= 10").MustRows(pick(c.phantom, "(3)", "(2)"))
+			t1.Do("COMMIT")
+
+			L.Note("serialization anomaly: both commit with a result no serial order gives (each counts, then inserts)")
+			t1.Begin(c.level)
+			t2.Begin(c.level)
+			t1.Do("SELECT count(*) FROM t131").MustRows("(3)")
+			t2.Do("SELECT count(*) FROM t131").MustRows("(3)")
+			t1.Do("INSERT INTO t131 VALUES (4, 3)")
+			t2.Do("INSERT INTO t131 VALUES (5, 3)")
+			t1.Do("COMMIT").MustOK()
+			c2 := t2.Do("COMMIT")
+			if c.anomaly {
+				c2.MustOK()
+			} else {
+				c2.MustFail(lab.IsSerialization)
+			}
+		})
+	}
+}
+
+// 13.2.1: the re-check does not need a lock wait. The target row "might have already been
+// updated (or deleted or locked) by another concurrent transaction by the time it is found";
+// the updater waits only "if it is still in progress". Here T2's UPDATE is held up inside its
+// own WHERE clause (on an advisory lock) while W updates the row and commits. T2 never waits
+// for a row lock, and still works on W's version: it re-checks v < 10 against it.
+func TestIso_RC_RecheckWithoutWait(t *testing.T) {
+	for _, c := range []struct{ name, concurrent, want, final string }{
+		{"still-matches", "UPDATE r SET v = 5 WHERE id = 1", "(105)", "(105)"},
+		{"no-longer-matches", "UPDATE r SET v = 50 WHERE id = 1", "(no rows)", "(50)"},
+		{"deleted", "DELETE FROM r WHERE id = 1", "(no rows)", "(no rows)"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			L := newLab(t)
+			setupRows(L)
+			w, t2 := L.Session("W"), L.Session("T2")
+			w.Do("SELECT pg_advisory_lock(7)")
+			upd := t2.Do("UPDATE r SET v = v + 100 WHERE id = 1 AND pg_advisory_xact_lock(7) IS NOT NULL AND v < 10 RETURNING v").MustBlock()
+			wait := L.QueryString("SELECT locktype FROM pg_locks WHERE pid = $1 AND NOT granted", t2.ID)
+			if wait != "advisory" {
+				t.Fatalf("T2 waits for a %s lock, want only the advisory lock", wait)
+			}
+			w.Do(c.concurrent).MustNotBlock().MustAffect(1)
+			L.Note("W has committed; nothing holds the row any more when T2 is let go")
+			w.Do("SELECT pg_advisory_unlock(7)")
+			upd.MustRows(c.want)
+			t2.Do("SELECT v FROM r WHERE id = 1").MustRows(c.final)
+		})
+	}
+}
+
+// 13.2.1: the docs' transfer between accounts 12345 and 7534, statement for statement, with
+// a concurrent debit of 7534 held open across the second UPDATE. "balance = balance - 100.00"
+// waits and is then applied to the updated row: both changes survive.
+func TestIso_RC_AccountsTransferDocsExample(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS accounts", "CREATE TABLE accounts (acctnum int primary key, balance numeric)",
+		"INSERT INTO accounts VALUES (12345, 1000.00), (7534, 1000.00)")
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1.Do("BEGIN")
+	t1.Do("UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 12345").MustAffect(1)
+	t2.Do("BEGIN")
+	t2.Do("UPDATE accounts SET balance = balance - 50.00 WHERE acctnum = 7534").MustAffect(1)
+	upd := t1.Do("UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 7534").MustBlock()
+	t2.Do("COMMIT")
+	upd.MustAffect(1)
+	t1.Do("COMMIT").MustOK()
+	t1.Do("SELECT acctnum, balance FROM accounts ORDER BY acctnum").MustRows("(7534,850.00) (12345,1100.00)")
+}
+
+// 13.2.2: "even a read-only transaction at this level may see a control record updated to
+// show that a batch has been completed but not see one of the detail records which is
+// logically part of the batch because it read an earlier revision of the control record."
+// The deposit report of TestIso_SER_ReadOnlyCanFailDeferrableCannot at REPEATABLE READ:
+// the report sees batch 1 closed with a total of 0, commits, and the total later becomes 100.
+func TestIso_RR_ReadOnlySeesClosedBatchWithoutReceipt(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS control", "DROP TABLE IF EXISTS receipt",
+		"CREATE TABLE control (deposit_no int)", "INSERT INTO control VALUES (1)",
+		"CREATE TABLE receipt (deposit_no int, amount int)")
+	t1, t2, ro := L.Session("T1"), L.Session("T2"), L.Session("RO")
+	const total = "SELECT coalesce(sum(amount), 0) FROM receipt WHERE deposit_no = 1"
+	t1.Begin(lab.RepeatableRead)
+	t1.Do("SELECT deposit_no FROM control").MustRows("(1)")
+	t1.Do("INSERT INTO receipt VALUES (1, 100)").MustOK()
+	t2.Begin(lab.RepeatableRead)
+	t2.Do("UPDATE control SET deposit_no = 2").MustAffect(1)
+	t2.Do("COMMIT").MustOK()
+	ro.Do("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+	ro.Do("SELECT deposit_no FROM control").MustRows("(2)")
+	ro.Do(total).MustRows("(0)")
+	t1.Do("COMMIT").MustOK()
+	ro.Do(total).MustRows("(0)")
+	ro.Do("COMMIT").MustOK()
+	L.Note("the report said: batch 1 is closed, total 0. Nothing failed, and the total is now 100")
+	ro.Do(total).MustRows("(100)")
+}
+
+// 13.2.2: at REPEATABLE READ, business rules "are not likely to work correctly without
+// careful use of explicit locks to block conflicting transactions". The on-call doctors of
+// TestIso_WriteSkew_OnCallDoctors, with the check made under an explicit lock:
+//   - FOR UPDATE on the rows the rule depends on: B waits for A, then fails with 40001
+//     (a row it wants to lock changed after its snapshot); its retry sees one doctor on call;
+//   - LOCK TABLE before the first query: B waits, and its snapshot, taken after the wait,
+//     already shows one doctor on call.
+func TestIso_RR_WriteSkewFixedByExplicitLocks(t *testing.T) {
+	setup := func(t *testing.T) (*lab.Lab, *lab.Session, *lab.Session) {
+		L := newLab(t)
+		L.Exec("DROP TABLE IF EXISTS doctors", "CREATE TABLE doctors (name text primary key, on_call bool)",
+			"INSERT INTO doctors VALUES ('alice', true), ('bob', true)")
+		return L, L.Session("A"), L.Session("B")
+	}
+	t.Run("FOR-UPDATE", func(t *testing.T) {
+		L, a, b := setup(t)
+		const check = "SELECT count(*) FROM (SELECT 1 FROM doctors WHERE on_call FOR UPDATE) x"
+		a.Begin(lab.RepeatableRead)
+		b.Begin(lab.RepeatableRead)
+		a.Do(check).MustRows("(2)")
+		chk := b.Do(check).MustBlock()
+		a.Do("UPDATE doctors SET on_call = false WHERE name = 'alice'")
+		a.Do("COMMIT").MustOK()
+		chk.MustFail(lab.IsSerialization)
+		b.Do("ROLLBACK")
+		L.Note("B retries: only one doctor is on call now, so bob stays")
+		b.Begin(lab.RepeatableRead)
+		b.Do(check).MustRows("(1)")
+		b.Do("COMMIT")
+	})
+	t.Run("LOCK-TABLE", func(t *testing.T) {
+		_, a, b := setup(t)
+		a.Begin(lab.RepeatableRead)
+		b.Begin(lab.RepeatableRead)
+		a.Do("LOCK TABLE doctors IN SHARE ROW EXCLUSIVE MODE")
+		lock := b.Do("LOCK TABLE doctors IN SHARE ROW EXCLUSIVE MODE").MustBlock()
+		a.Do("SELECT count(*) FROM doctors WHERE on_call").MustRows("(2)")
+		a.Do("UPDATE doctors SET on_call = false WHERE name = 'alice'")
+		a.Do("COMMIT").MustOK()
+		lock.MustOK()
+		b.Do("SELECT count(*) FROM doctors WHERE on_call").MustRows("(1)")
+		b.Do("COMMIT")
+	})
+}
+
+// 13.2.3: the other way to generate a key, "selecting the maximum existing key and adding
+// one". Both transactions read max(id) + 1 = 3 and insert it; the loser gets a serialization
+// failure (40001), not a unique violation.
+func TestIso_SER_MaxPlusOneKeyTurnsUniqueViolationInto40001(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS k", "CREATE TABLE k (id int primary key)", "INSERT INTO k VALUES (1), (2)")
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	for _, s := range []*lab.Session{t1, t2} {
+		s.Begin(lab.Serializable)
+		s.Do("SELECT max(id) + 1 FROM k").MustRows("(3)")
+	}
+	t1.Do("INSERT INTO k VALUES (3)")
+	ins := t2.Do("INSERT INTO k VALUES (3)").MustBlock()
+	t1.Do("COMMIT")
+	ins.MustFail(lab.IsSerialization)
+}
+
+// 13.2.3: when page-level predicate locks are combined into one relation-level lock, "an
+// increase in the rate of serialization failures may occur". T1 and T2 read and update
+// disjoint rows (ids up to 800, ids above 1200: different heap and index pages). Reading 20
+// rows each, they keep tuple locks and both commit. Reading 40 rows each, on 40 pages, their
+// locks are promoted to the whole relation, each one's UPDATE now conflicts with the other's
+// read, and one of them fails. (The remedy, raising max_pred_locks_per_*, needs a server
+// reload and is not run here.)
+func TestIso_SER_PromotedPredicateLockCausesFalsePositive(t *testing.T) {
+	for _, rows := range []int{20, 40} {
+		t.Run(fmt.Sprintf("%d-rows-each", rows), func(t *testing.T) {
+			L := newLab(t)
+			L.Exec("DROP TABLE IF EXISTS pl", "CREATE TABLE pl (id int primary key, pad text)",
+				"INSERT INTO pl SELECT g, repeat('x', 500) FROM generate_series(1, 2000) g", "ANALYZE pl")
+			if L.QueryString("SELECT current_setting('max_pred_locks_per_page') || ',' || current_setting('max_pred_locks_per_relation') || ',' || current_setting('max_pred_locks_per_transaction')") != "2,-2,64" {
+				t.Skip("the thresholds below assume the default max_pred_locks_* settings")
+			}
+			t1, t2 := L.Session("T1"), L.Session("T2")
+			for i, s := range []*lab.Session{t1, t2} {
+				s.Do("SET enable_seqscan = off")
+				s.Do("SET enable_bitmapscan = off")
+				s.Begin(lab.Serializable)
+				s.Do(fmt.Sprintf("SELECT count(pad) FROM pl WHERE id = ANY (SELECT %d + g * 20 FROM generate_series(1, %d) g)", i*1200, rows)).
+					MustRows(fmt.Sprintf("(%d)", rows))
+			}
+			relLocks := L.QueryString("SELECT count(*) FROM pg_locks WHERE mode = 'SIReadLock' AND locktype = 'relation' AND relation = 'pl'::regclass")
+			promoted := rows == 40
+			if want := map[bool]string{false: "0", true: "2"}[promoted]; relLocks != want {
+				t.Fatalf("relation-level SIRead locks on pl: %s, want %s", relLocks, want)
+			}
+			ops := []*lab.Op{
+				t1.Do("UPDATE pl SET pad = 'a' WHERE id = 20"),
+				t2.Do("UPDATE pl SET pad = 'b' WHERE id = 1220"),
+				t1.Do("COMMIT"),
+				t2.Do("COMMIT"),
+			}
+			failures := 0
+			for _, op := range ops {
+				if op.Wait(); op.Err != nil && !op.Skipped {
+					failures++
+					if !lab.IsSerialization(op.Err) {
+						t.Fatalf("%q failed with %s, want 40001", op.SQL, lab.Describe(op.Err))
+					}
+				}
+			}
+			if want := map[bool]int{false: 0, true: 1}[promoted]; failures != want {
+				t.Fatalf("%d serialization failures, want %d", failures, want)
+			}
+			t2.Do("ROLLBACK")
+		})
+	}
+}
+
+// 13.3.1 Tip: "Only an ACCESS EXCLUSIVE lock blocks a SELECT (without FOR UPDATE/SHARE)
+// statement."
+func TestLock_OnlyAccessExclusiveBlocksSelect(t *testing.T) {
+	L := newLab(t)
+	setupRows(L)
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	for _, mode := range tableLockModes {
+		t1.Do("BEGIN")
+		t1.Do("LOCK TABLE r IN " + mode + " MODE")
+		sel := t2.Do("SELECT count(*) FROM r")
+		if mode == "ACCESS EXCLUSIVE" {
+			sel.MustBlock()
+		} else {
+			sel.MustNotBlock()
+		}
+		t1.Do("ROLLBACK")
+		sel.MustRows("(2)")
+	}
+}
+
+// 13.3.2: a waiting writer and NOWAIT. T2's UPDATE waits for T1's FOR SHARE: in pg_locks it
+// holds the "tuple" lock and waits for T1's transaction id. That does not stop a compatible
+// FOR SHARE NOWAIT from a third session: it joins T1's lock in the tuple header.
+//
+// It does fail (55P03) in one shape: T1 took FOR UPDATE in a subtransaction and rolled it
+// back. pgrowlocks then still lists that FOR UPDATE in the tuple's multixact, and (measured)
+// with a waiter in the queue the NOWAIT request fails. Without the waiter the same request
+// succeeds (TestLock_RowLockSavepoints).
+func TestLock_WaitingWriterAndShareNowait(t *testing.T) {
+	for _, rolledBackForUpdate := range []bool{false, true} {
+		name := "holder-for-share"
+		if rolledBackForUpdate {
+			name = "holder-for-share-plus-rolled-back-for-update"
+		}
+		t.Run(name, func(t *testing.T) {
+			L := newLab(t)
+			setupRows(L)
+			t1, t2, t3 := L.Session("T1"), L.Session("T2"), L.Session("T3")
+			t1.Do("BEGIN")
+			t1.Do("SELECT * FROM r WHERE id = 1 FOR SHARE")
+			if rolledBackForUpdate {
+				t1.Do("SAVEPOINT a")
+				t1.Do("SELECT * FROM r WHERE id = 1 FOR UPDATE")
+				t1.Do("ROLLBACK TO SAVEPOINT a")
+			}
+			upd := t2.Do("UPDATE r SET v = 1 WHERE id = 1").MustBlock()
+			locks := L.ShowLocks()
+			if _, ok := lab.FindLock(locks, "T2", "ExclusiveLock", ""); !ok {
+				t.Errorf("T2 does not hold the tuple lock while it waits")
+			}
+			L.Show("SELECT locked_row, multi, modes FROM pgrowlocks('r')")
+			probe := t3.Do("SELECT 1 FROM r WHERE id = 1 FOR SHARE NOWAIT")
+			if rolledBackForUpdate {
+				probe.MustFail(lab.IsLockNotAvailable)
+			} else {
+				probe.MustRows("(1)")
+			}
+			t1.Do("COMMIT")
+			upd.MustAffect(1)
+		})
+	}
+}
+
+// 13.3.2: "locking a row might cause a disk write, e.g., SELECT FOR UPDATE modifies selected
+// rows to mark them locked, and so will result in disk writes." EXPLAIN (ANALYZE, WAL) shows
+// the WAL record the lock writes; the same SELECT without FOR UPDATE writes none.
+func TestLock_RowLockCausesDiskWrite(t *testing.T) {
+	L := newLab(t)
+	setupRows(L)
+	s := L.Session("T1")
+	s.Do("SELECT * FROM r") // sets the hint bits, so that the control below has nothing to write
+	const explain = "EXPLAIN (ANALYZE, WAL, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT * FROM r WHERE id = 2"
+	if plain := s.Do(explain).Text(); strings.Contains(plain, "WAL:") {
+		t.Fatalf("a plain SELECT wrote WAL: %s", plain)
+	}
+	s.Do("BEGIN")
+	locking := s.Do(explain + " FOR UPDATE").Text()
+	s.Do("ROLLBACK")
+	if !strings.Contains(locking, "WAL: records=1") {
+		t.Fatalf("SELECT FOR UPDATE of one row should write one WAL record: %s", locking)
+	}
+}
+
+// 13.4.2: "use Read Committed mode, or in Repeatable Read mode be careful to obtain locks
+// before performing queries". In READ COMMITTED the order does not matter: a query run after
+// the lock was granted takes a new snapshot and sees what the lock waited for.
+func TestIso_RC_QueryAfterLockSeesWaitedForWrites(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS credits", "CREATE TABLE credits (amount int)", "INSERT INTO credits VALUES (100)")
+	chk, wr := L.Session("CHK"), L.Session("WR")
+	wr.Do("BEGIN")
+	wr.Do("INSERT INTO credits VALUES (50)")
+	chk.Begin(lab.ReadCommitted)
+	chk.Do("SELECT sum(amount) FROM credits").MustRows("(100)")
+	lock := chk.Do("LOCK TABLE credits IN SHARE MODE").MustBlock()
+	wr.Do("COMMIT")
+	lock.MustOK()
+	chk.Do("SELECT sum(amount) FROM credits").MustRows("(150)")
+	chk.Do("COMMIT")
+}
+
+// 13.4.2: the bank check done with explicit locks: "lock all tables needed for the check".
+// A SHARE lock "guarantee[s] that there are no uncommitted changes in the locked table,
+// other than those of the current transaction": the lock waits for the writer that is in
+// the middle of changing both tables, the two sums then agree, and the checker's own
+// uncommitted insert is not in its own way.
+func TestIso_SumCheckWithShareLocks(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS credits", "DROP TABLE IF EXISTS debits",
+		"CREATE TABLE credits (amount int)", "CREATE TABLE debits (amount int)",
+		"INSERT INTO credits VALUES (100)", "INSERT INTO debits VALUES (100)")
+	chk, wr := L.Session("CHK"), L.Session("WR")
+	wr.Do("BEGIN")
+	wr.Do("INSERT INTO credits VALUES (50)")
+	chk.Begin(lab.ReadCommitted)
+	lock := chk.Do("LOCK TABLE credits, debits IN SHARE MODE").MustBlock()
+	wr.Do("INSERT INTO debits VALUES (50)").MustNotBlock().MustOK()
+	wr.Do("COMMIT")
+	lock.MustOK()
+	chk.Do("SELECT (SELECT sum(amount) FROM credits), (SELECT sum(amount) FROM debits)").MustRows("(150,150)")
+	ins := wr.Do("INSERT INTO credits VALUES (1)").MustBlock()
+	L.Note("no one else can change the tables now, but the lock holder itself can")
+	chk.Do("INSERT INTO debits VALUES (7)").MustNotBlock().MustOK()
+	chk.Do("SELECT sum(amount) FROM debits").MustRows("(157)")
+	chk.Do("ROLLBACK")
+	ins.MustOK()
+}
+
+// 13.5: "There are also some corner cases in which the server will issue a unique-key or
+// exclusion constraint error even though in principle it has enough information to determine
+// that a serialization problem is the underlying cause." Both SERIALIZABLE transactions check
+// for an overlapping booking before inserting one. With a unique key that protocol turns
+// the error into 40001 (TestIso_SER_CheckBeforeInsertTurnsUniqueViolationInto40001); with
+// an exclusion constraint the loser still gets 23P01.
+func TestIso_SER_ExclusionConstraintErrorStays23P01(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS booking", "CREATE TABLE booking (room int, during int4range, EXCLUDE USING gist (during WITH &&))")
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1.Begin(lab.Serializable)
+	t1.Do("SELECT count(*) FROM booking WHERE during && '[1,5)'").MustRows("(0)")
+	t1.Do("INSERT INTO booking VALUES (1, '[1,5)')")
+	t2.Begin(lab.Serializable)
+	t2.Do("SELECT count(*) FROM booking WHERE during && '[3,8)'").MustRows("(0)")
+	ins := t2.Do("INSERT INTO booking VALUES (1, '[3,8)')").MustBlock()
+	t1.Do("COMMIT").MustOK()
+	ins.MustFail(func(err error) bool { return lab.Code(err) == "23P01" })
+	t2.Do("ROLLBACK")
+}
+
+// 13.7: "insertion of a GIN-indexed value usually produces several index key insertions per
+// row". One row holding a five-element array adds five entries to the index. (The page- and
+// bucket-level locks the section is about are not visible from SQL.)
+func TestMVCC_GinIndexSeveralKeysPerRow(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS g", "CREATE TABLE g (a int[])",
+		"CREATE INDEX g_gin ON g USING gin (a) WITH (fastupdate = off)",
+		"INSERT INTO g VALUES ('{1,2,3,4,5}')", "VACUUM g")
+	rows := L.Show("SELECT (SELECT count(*) FROM g) AS table_rows, n_entries AS index_entries FROM gin_metapage_info(get_raw_page('g_gin', 0))")
+	if got := lab.FormatRows(rows); got != "(1,5)" {
+		t.Fatalf("rows, index entries = %s, want (1,5)", got)
+	}
 }

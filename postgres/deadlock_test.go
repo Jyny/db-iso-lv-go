@@ -142,19 +142,32 @@ func TestDeadlock_AccountsDocsExample(t *testing.T) {
 			s.Do("COMMIT").MustOK()
 		}
 	}
-	t1.Do("SELECT sum(balance) FROM accounts").MustRows("(2000.00)")
+	// Only the survivor's transfer is applied. Which one survives is not asserted.
+	afterFirst := "(11111,1100.00) (22222,900.00)"
+	if victim.S == t1 {
+		afterFirst = "(11111,900.00) (22222,1100.00)"
+	}
+	t1.Do("SELECT acctnum, balance FROM accounts ORDER BY acctnum").MustRows(afterFirst)
 
-	L.Note("13.3.4: deadlocks can be handled on the fly by retrying: the victim's transfer, run again, now succeeds")
+	L.Note("13.3.4: deadlocks can be handled on the fly by retrying: the victim's own transfer, run again, now succeeds")
+	transfer := map[*lab.Session][]string{
+		t1: {
+			"UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 11111",
+			"UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 22222",
+		},
+		t2: {
+			"UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 22222",
+			"UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 11111",
+		},
+	}
 	retry := victim.S
 	retry.Do("BEGIN")
-	for _, sql := range []string{
-		"UPDATE accounts SET balance = balance + 100.00 WHERE acctnum = 22222",
-		"UPDATE accounts SET balance = balance - 100.00 WHERE acctnum = 11111",
-	} {
+	for _, sql := range transfer[retry] {
 		retry.Do(sql).MustNotBlock().MustAffect(1)
 	}
 	retry.Do("COMMIT").MustOK()
-	t1.Do("SELECT sum(balance) FROM accounts").MustRows("(2000.00)")
+	L.Note("both transfers applied exactly once")
+	t1.Do("SELECT acctnum, balance FROM accounts ORDER BY acctnum").MustRows("(11111,1000.00) (22222,1000.00)")
 
 	L.Note("the same two transfers, both touching 11111 first: the second one queues, no deadlock")
 	t1.Do("BEGIN")
