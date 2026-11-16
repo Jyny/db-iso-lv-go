@@ -148,10 +148,16 @@ func TestLock_NoIndexLocksEverything(t *testing.T) {
 			locks := L.ShowLocks()
 			t2.Begin(level)
 			other := t2.Do("UPDATE t SET v = -2 WHERE id = 30")
-			ins := t2.Do("INSERT INTO t VALUES (40, 40, 40)")
+			// A third session: T2 is busy (blocked) in REPEATABLE READ.
+			ins := L.Session("T3").Do("INSERT INTO t VALUES (40, 40, 40)")
 			if level == lab.RepeatableRead {
-				mustHaveLock(t, locks, "T1", "X", "supremum pseudo-record")
+				for _, rec := range []string{"10", "20", "30", "supremum pseudo-record"} {
+					mustHaveLock(t, locks, "T1", "X", rec)
+				}
 				other.MustBlock()
+				L.Note(`"every row of the table becomes locked, which in turn blocks all inserts by other users"`)
+				ins.MustBlock()
+				L.Session("T4").Do("INSERT INTO t VALUES (15, 15, 15)").MustBlock()
 				t1.Do("ROLLBACK")
 				L.WaitAll()
 				other.MustOK()
@@ -170,7 +176,7 @@ func TestLock_NoIndexLocksEverything(t *testing.T) {
 }
 
 // READ COMMITTED takes no gap locks for searches, so a phantom can be inserted
-// into a range another transaction has "locked". READ UNCOMMITTED "otherwise works like
+// into a range another transaction has "locked". READ UNCOMMITTED otherwise "works like
 // READ COMMITTED" (17.7.2.1): the same.
 func TestLock_RC_NoGapLocks(t *testing.T) {
 	for _, level := range []lab.Level{lab.ReadCommitted, lab.ReadUncommitted} {

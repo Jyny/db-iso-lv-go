@@ -163,8 +163,9 @@ var scenarios = []scenario{
 		name: "PMP-write", desc: "Predicate-Many-Preceders (write): DELETE's predicate mixes old and new row versions",
 		// mysql.md's repeatable-read interleaving on every DB and level: T2's SELECT comes
 		// after T1's UPDATE (postgres.md has no SELECT; harmless on PG). mysql.md's
-		// serializable block puts the SELECT before the UPDATE, which deadlocks instead of
-		// waiting; that variant is replayed in TestHermitageDocs.
+		// serializable block puts the SELECT before the UPDATE, which the document (5.6) says
+		// deadlocks; on 9.7 T1 just waits for T2's commit. That variant is replayed in
+		// TestHermitageDocs (see docNow).
 		run: func(e *env) bool {
 			e.begin()
 			e.T1.Do("update test set value = value + 10")

@@ -21,7 +21,9 @@ import (
 //
 // Run: go test ./hermitage -v -run 'TestHermitageDocs/mysql/G2-item_serializable'
 
-// docStep is one line of a code block. want is what the document says about it:
+// docStep is one line of a code block. want is what the document says about it. (The four
+// P4 blocks also assert "=(1,10)" for their initial "select * from test where id = 1",
+// which the documents leave uncommented: the lost update is only visible against it.)
 //
 //	""         runs without waiting and without error
 //	"=…"       returns these rows (in any order); "=none" for an empty result
@@ -51,7 +53,7 @@ type docBlock struct {
 }
 
 const (
-	docDeadlock  = "!Deadlock found when trying to get lock; try restarting transaction"
+	docDeadlock  = "!ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction"
 	docPGUpdate  = "!could not serialize access due to concurrent update"
 	docPGDepends = "!could not serialize access due to read/write dependencies among transactions"
 )
@@ -467,7 +469,9 @@ var mysqlDocs = []docBlock{
 var docNow = map[string]map[int][2]string{
 	"mysql/PMP-write_serializable": {1: {"#1",
 		"no deadlock: T2 already holds S locks on the rows, and its DELETE upgrades them to X without\n" +
-			"queueing behind T1's waiting request. T1 waits, then updates the one row T2 left (serial order T2 → T1)"}},
+			"queueing behind T1's waiting request. T1 waits, then updates the one row T2 left (serial order T2 → T1).\n" +
+			"The document's next step, \"rollback; -- T1\", is queued behind that waiting UPDATE and undoes it\n" +
+			"after T2's commit, so the table ends as (1,10)"}},
 }
 
 // docNowFrees: the same, for which blocked statements a step unblocks.
@@ -522,9 +526,13 @@ func TestHermitageDocs(t *testing.T) {
 			for _, b := range db.blocks {
 				t.Run(b.name+"_"+strings.ReplaceAll(b.level, " ", "_"), func(t *testing.T) {
 					L := lab.New(t, db.kind, dbname)
-					L.Exec("DROP TABLE IF EXISTS test",
-						"CREATE TABLE test (id int primary key, value int)",
-						"INSERT INTO test (id, value) VALUES (1, 10), (2, 20)")
+					// The documents' setup block; mysql.md's has "engine=innodb".
+					create := "create table test (id int primary key, value int)"
+					if db.kind == lab.MySQL {
+						create += " engine=innodb"
+					}
+					L.Exec("DROP TABLE IF EXISTS test", create,
+						"insert into test (id, value) values (1, 10), (2, 20)")
 					sess := []*lab.Session{nil, L.Session("T1"), L.Session("T2"), L.Session("T3")}
 					// The documents' own preamble for each session.
 					begin := func(i int) {

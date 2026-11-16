@@ -221,6 +221,19 @@ var deadlockCases = []deadlockCase{
 		},
 		deadlock: true,
 	},
+	{
+		name: "RepeatableRead_ReadThenUpdate",
+		why: "the same four statements as Serializable_ReadThenUpdate at REPEATABLE READ: the plain\n" +
+			"SELECTs take no locks, so T2's UPDATE just waits for T1. The isolation level decides\n" +
+			"whether this workload can deadlock",
+		steps: []step{
+			{1, "SELECT v FROM t WHERE id = 10"},
+			{2, "SELECT v FROM t WHERE id = 10"},
+			{1, "UPDATE t SET v = 1 WHERE id = 10"},
+			{2, "UPDATE t SET v = 2 WHERE id = 10"},
+		},
+		deadlock: false,
+	},
 }
 
 func TestDeadlock(t *testing.T) {
