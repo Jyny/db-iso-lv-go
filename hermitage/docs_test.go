@@ -16,8 +16,8 @@ import (
 //	https://github.com/ept/hermitage/blob/master/postgres.md  (written for PostgreSQL 9.3.5)
 //	https://github.com/ept/hermitage/blob/master/mysql.md     (written for MySQL 5.6.21)
 //
-// TestHermitage runs one script per anomaly on every level; this test is the documents'
-// own scripts, which differ per level where a lock would otherwise get in the way.
+// TestHermitage runs one of the documents' scripts per anomaly and DB on every level; this
+// test is every block, which differ per level where a lock would otherwise get in the way.
 //
 // Run: go test ./hermitage -v -run 'TestHermitageDocs/mysql/G2-item_serializable'
 
