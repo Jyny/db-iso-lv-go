@@ -49,7 +49,15 @@ func setGlobal(t *testing.T, L *lab.Lab, name, value string) {
 // 17.7.1 Intention Locks: the table-level compatibility matrix. IS and IX come from
 // FOR SHARE / FOR UPDATE on a row (a different row for each session, so only the table
 // level can conflict); table-level S and X come from LOCK TABLES ... READ / WRITE with
-// autocommit=0, which is when InnoDB also takes its own table lock.
+// autocommit=0, which is when InnoDB also takes its own table lock (checked first, in
+// data_locks).
+//
+// The measured conflicts match the manual's matrix, but every one of them is decided by the
+// server's metadata locks before InnoDB is asked: FOR SHARE / FOR UPDATE take MDL
+// SHARED_READ / SHARED_WRITE, LOCK TABLES READ / WRITE take SHARED_READ_ONLY /
+// SHARED_NO_READ_WRITE, and those conflict exactly where IS / IX / S / X do. The test
+// asserts that each blocked request waits on a metadata lock and not in data_lock_waits.
+// InnoDB's own table-lock matrix is not reachable from SQL.
 func TestLock_IntentionLockMatrix(t *testing.T) {
 	L := newLab(t)
 	setupT(L)
@@ -103,6 +111,15 @@ func TestLock_IntentionLockMatrix(t *testing.T) {
 			acquire(t1, held, 10)
 			op := acquire(t2, req, 20)
 			blocked := op.Blocked
+			if blocked {
+				mdl := L.QueryString(`SELECT count(*) FROM performance_schema.metadata_locks ml
+					JOIN performance_schema.threads th ON th.THREAD_ID = ml.OWNER_THREAD_ID
+					WHERE th.PROCESSLIST_ID = ? AND ml.LOCK_STATUS = 'PENDING'`, t2.ID)
+				innodb := L.QueryString("SELECT count(*) FROM performance_schema.data_lock_waits")
+				if mdl == "0" || innodb != "0" {
+					t.Errorf("held %s, requested %s: %s pending metadata locks, %s InnoDB lock waits; want a metadata-lock wait only", held, req, mdl, innodb)
+				}
+			}
 			release(t1)
 			op.Wait()
 			release(t2)
@@ -191,7 +208,7 @@ func TestLock_MultiColumnUniquePrefixTakesGapLocks(t *testing.T) {
 }
 
 // 17.7.1 Next-Key Locks: with index values 10, 11, 13, 20 the next-key intervals are
-// (-inf,10] (10,11] (11,13] (13,20] (20,+inf). "id > 15" locks (13,20] and (20,+inf),
+// (-inf,10] (10,11] (11,13] (13,20] (20,+inf). A locking read of id > 15 locks (13,20] and (20,+inf),
 // the last one on the supremum pseudo-record.
 func TestLock_NextKeyIntervalsDocsExample(t *testing.T) {
 	L := newLab(t)
@@ -255,7 +272,10 @@ func TestLock_InsertIntentionAndPhantomDocsExample(t *testing.T) {
 // 17.7.1 AUTO-INC Locks and 17.7.3 AUTO_INCREMENT: MySQL 8.0+ defaults to
 // innodb_autoinc_lock_mode = 2 ("interleaved"), which takes no table-level AUTO-INC lock,
 // so concurrent inserts (even INSERT ... SELECT) never wait for each other and a
-// rolled-back insert leaves a gap. Modes 0 and 1 need a server restart to observe.
+// rolled-back insert leaves a gap. An AUTO-INC lock is held only to the end of the
+// statement, so T1's INSERT ... SELECT is kept running (stuck on a source row T3 has
+// locked) while T2 inserts: in modes 0 and 1 T2 would wait for it. Those modes need a
+// server restart to observe.
 func TestLock_AutoIncInterleavedMode(t *testing.T) {
 	L := newLab(t)
 	if m := L.QueryString("SELECT @@innodb_autoinc_lock_mode"); m != "2" {
@@ -263,20 +283,25 @@ func TestLock_AutoIncInterleavedMode(t *testing.T) {
 	}
 	setupT(L)
 	L.Exec("DROP TABLE IF EXISTS ai", "CREATE TABLE ai (id int AUTO_INCREMENT PRIMARY KEY, v int)")
-	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1, t2, t3 := L.Session("T1"), L.Session("T2"), L.Session("T3")
+	t3.Do("START TRANSACTION")
+	t3.Do("SELECT * FROM t WHERE id = 30 FOR UPDATE")
 	t1.Do("START TRANSACTION")
 	t1.Do("INSERT INTO ai (v) VALUES (1)")
-	t1.Do("INSERT INTO ai (v) SELECT v FROM t")
+	bulk := t1.Do("INSERT INTO ai (v) SELECT v FROM t").MustBlock()
+	L.Note("T1's INSERT ... SELECT is still running (waiting for row 30)")
 	for _, k := range L.ShowLocks() {
 		if strings.Contains(k.Mode, "AUTO_INC") {
 			t.Fatalf("unexpected AUTO-INC lock: %v", k)
 		}
 	}
 	t2.Do("INSERT INTO ai (v) VALUES (2)").MustNotBlock().MustOK()
+	t3.Do("COMMIT")
+	bulk.MustAffect(3)
 	t1.Do("ROLLBACK")
 	L.Note("T1's ids were consumed and are not reused: T2's row does not get id 1")
-	if id := t2.Do("SELECT id FROM ai").Int(); id <= 4 {
-		t.Fatalf("T2's id = %d; ids 1-4 were reserved by T1's inserts", id)
+	if id := t2.Do("SELECT id FROM ai").Int(); id <= 1 {
+		t.Fatalf("T2's id = %d; id 1 was reserved by T1's first insert", id)
 	}
 }
 
@@ -323,6 +348,9 @@ func TestLock_SemiConsistentReadDocsExample(t *testing.T) {
 		{"RC", lab.ReadCommitted, false, false},
 		{"RR", lab.RepeatableRead, false, true},
 		{"RC-indexed", lab.ReadCommitted, true, true},
+		// "If the row matches (must be updated), MySQL reads the row again and this time
+		// InnoDB either locks it or waits for a lock on it."
+		{"RC-latest-committed-matches", lab.ReadCommitted, false, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			L := newLab(t)
@@ -340,6 +368,9 @@ func TestLock_SemiConsistentReadDocsExample(t *testing.T) {
 				a.Begin(c.level)
 				a.Do("UPDATE sc SET b = 5 WHERE b = 3").MustAffect(2)
 				bStmt = "UPDATE sc SET b = 4 WHERE b = 2"
+				if c.name == "RC-latest-committed-matches" {
+					bStmt = "UPDATE sc SET b = 4 WHERE b = 3"
+				}
 				// READ COMMITTED keeps x-locks only on the two rows it changed; REPEATABLE
 				// READ keeps one on every row it read (5 rows + the supremum).
 				want := 2
@@ -352,12 +383,23 @@ func TestLock_SemiConsistentReadDocsExample(t *testing.T) {
 			}
 			b.Begin(c.level)
 			op := b.Do(bStmt)
-			if c.blocks {
+			switch {
+			case c.name == "RC-latest-committed-matches":
+				L.Note("rows 2 and 4 are locked by A, but their latest committed b = 3 matches: B waits")
+				op.MustBlock()
+				a.Do("COMMIT")
+				L.Note("after A commits they read b = 5 and no longer match")
+				op.MustAffect(0)
+			case c.blocks:
 				op.MustBlock()
 				a.Do("COMMIT")
 				op.MustOK()
-			} else {
+			default:
 				op.MustNotBlock().MustAffect(3)
+				L.Note("B retains x-locks on the three rows it updated and unlocks the two it skipped")
+				if got := recordLocks(L.ShowLocks(), "B"); len(got) != 3 {
+					t.Errorf("B holds record locks %v, want 3", got)
+				}
 				a.Do("COMMIT")
 			}
 			b.Do("COMMIT")
@@ -608,7 +650,9 @@ func TestLock_LockingReadsDocs(t *testing.T) {
 		s3.Do("SELECT * FROM tn WHERE i = 2 FOR SHARE NOWAIT").MustFail(func(err error) bool { return lab.Code(err) == "3572" })
 		s3.Do("SELECT * FROM tn FOR SHARE SKIP LOCKED").MustRows("(1) (3)")
 		L.Note("the old spelling takes none of the new options")
-		s3.Do("SELECT * FROM tn WHERE i = 1 LOCK IN SHARE MODE NOWAIT").MustFail(func(err error) bool { return lab.Code(err) == "1064" })
+		for _, opt := range []string{"NOWAIT", "SKIP LOCKED", "OF tn"} {
+			s3.Do("SELECT * FROM tn WHERE i = 1 LOCK IN SHARE MODE " + opt).MustFail(func(err error) bool { return lab.Code(err) == "1064" })
+		}
 	})
 
 	t.Run("nowait-applies-to-row-locks-only", func(t *testing.T) {
@@ -708,7 +752,7 @@ func TestLock_LockingReadsDocs(t *testing.T) {
 		t2.Do("INSERT INTO parent VALUES (1, 'Jones')")
 		t1.Do("START TRANSACTION")
 		t1.Do("SELECT * FROM parent WHERE name = 'Jones' FOR SHARE").MustRows("(1,Jones)")
-		L.Note("Jones cannot be deleted until T1 has inserted its child row and committed")
+		L.Note("Jones cannot be deleted until T1 (which would now insert its child row) commits")
 		del := t2.Do("DELETE FROM parent WHERE id = 1").MustBlock()
 		t1.Do("COMMIT")
 		del.MustAffect(1)
@@ -1001,8 +1045,9 @@ func TestDeadlock_DetectionDisabledFallsBackToTimeout(t *testing.T) {
 	t2.Do("COMMIT")
 }
 
-// 17.7.5.2: by default a lock wait timeout rolls back just the statement; the rest of the
-// transaction can still commit.
+// 17.7.5.2 says that with deadlock detection disabled InnoDB relies on innodb_lock_wait_timeout
+// "for transaction rollback". By default (innodb_rollback_on_timeout = OFF) the timeout
+// (ERROR 1205) rolls back just the statement; the rest of the transaction can still commit.
 func TestTx_LockWaitTimeoutRollsBackOnlyStatement(t *testing.T) {
 	L := newLab(t)
 	setupT(L)
@@ -1022,8 +1067,10 @@ func TestTx_LockWaitTimeoutRollsBackOnlyStatement(t *testing.T) {
 }
 
 // 17.7.5.3 How to Minimize and Handle Deadlocks: serialize conflicting transactions on a
-// "semaphore" row that each updates first. Deadlock detection keeps working because it is a
-// row lock.
+// "semaphore" row that each updates first. "The InnoDB instant deadlock detection algorithm
+// also works in this case, because the serializing lock is a row-level lock": a transaction
+// that skips the protocol and closes a cycle through the semaphore row is caught at once
+// (ERROR 1213), not after innodb_lock_wait_timeout.
 func TestDeadlock_AvoidedBySemaphoreRow(t *testing.T) {
 	L := newLab(t)
 	setupT(L)
@@ -1040,6 +1087,21 @@ func TestDeadlock_AvoidedBySemaphoreRow(t *testing.T) {
 	t2.Do("DELETE FROM t WHERE id = 20").MustAffect(0)
 	t2.Do("DELETE FROM t WHERE id = 10").MustAffect(0)
 	t2.Do("COMMIT")
+
+	L.Note("T2 locks a row before the semaphore; T1, holding the semaphore, then needs that row")
+	t1.Do("START TRANSACTION")
+	t2.Do("START TRANSACTION")
+	t1.Do("UPDATE sem SET id = id WHERE id = 1")
+	t2.Do("UPDATE t SET v = 2 WHERE id = 30")
+	a := t2.Do("UPDATE sem SET id = id WHERE id = 1").MustBlock()
+	before := innodbDeadlocks(L)
+	b := t1.Do("UPDATE t SET v = 1 WHERE id = 30")
+	lab.ExpectOneDeadlockVictim(t, a, b)
+	if n := innodbDeadlocks(L); n != before+1 {
+		t.Errorf("lock_deadlocks moved by %d, want 1", n-before)
+	}
+	t1.Do("ROLLBACK")
+	t2.Do("ROLLBACK")
 }
 
 // 17.7.5.3: the last-resort fix, serializing with table locks. LOCK TABLES with
@@ -1136,8 +1198,8 @@ func TestTx_LockTablesImplicitCommit(t *testing.T) {
 // unless innodb_table_locks = 0. Two measured differences from the 8.4 manual on 9.7:
 //   - the manual says the variable has no effect on LOCK TABLES ... WRITE; on 9.7, 0 drops
 //     the InnoDB table lock for WRITE too.
-//   - the manual says that with 0, LOCK TABLES "completes even if other transactions hold row
-//     locks"; it still waits, on the metadata lock the other transaction holds until it
+//   - the manual says that with 0, LOCK TABLES "completes even if some records of the
+//     tables are being locked by other transactions"; it still waits, on the metadata lock the other transaction holds until it
 //     ends, before InnoDB is even asked.
 func TestLock_InnoDBTableLocksVariable(t *testing.T) {
 	L := newLab(t)
@@ -1239,14 +1301,14 @@ func TestLock_GrantTablesAreReadWithoutLocks(t *testing.T) {
 	setupT(L)
 	L.Exec("DROP TABLE IF EXISTS dst", "CREATE TABLE dst (u varchar(64))")
 	s := L.Session("S")
-	check := func(what string) {
+	check := func(what string, wantT bool) {
 		t.Helper()
 		var onUser, onT int
 		for _, k := range L.ShowLocks() {
-			switch {
-			case strings.HasPrefix(k.Object, "user"):
+			switch table, _, _ := strings.Cut(k.Object, "."); table {
+			case "user":
 				onUser++
-			case strings.HasPrefix(k.Object, "t"):
+			case "t":
 				onT++
 			}
 		}
@@ -1254,14 +1316,17 @@ func TestLock_GrantTablesAreReadWithoutLocks(t *testing.T) {
 		if onUser != 0 {
 			t.Errorf("%s: %d lock(s) on mysql.user", what, onUser)
 		}
+		if wantT && onT == 0 {
+			t.Errorf("%s: no locks on t; the control should lock it", what)
+		}
 	}
 	s.Begin(lab.Serializable)
 	s.Do("SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM mysql.user WHERE user = 'root')").MustOK()
-	check("SERIALIZABLE SELECT joining mysql.user")
+	check("SERIALIZABLE SELECT joining mysql.user", true)
 	s.Do("ROLLBACK")
 	s.Begin(lab.RepeatableRead)
 	s.Do("INSERT INTO dst SELECT user FROM mysql.user").MustOK()
-	check("INSERT ... SELECT FROM mysql.user")
+	check("INSERT ... SELECT FROM mysql.user", false)
 	s.Do("ROLLBACK")
 }
 
@@ -1325,9 +1390,10 @@ func TestLock_MonitorOutputDocsExamples(t *testing.T) {
 	ins := b.Do("INSERT INTO child (id) VALUES (101)").MustBlock()
 	status := L.Query("SHOW ENGINE INNODB STATUS")[0][2]
 	for what, want := range map[string]string{
-		"intention lock":        "TABLE LOCK table `" + dbname + "`.`child` trx id",
-		"intention lock mode":   "lock mode IX",
-		"record lock":           "lock_mode X locks rec but not gap",
+		"intention lock":      "TABLE LOCK table `" + dbname + "`.`child` trx id",
+		"intention lock mode": "lock mode IX",
+		"record lock":         "lock_mode X locks rec but not gap",
+		// the manual prints index `PRIMARY`; 9.7 drops the backquotes around the index name
 		"record lock header":    "index PRIMARY of table `" + dbname + "`.`child`",
 		"next-key lock":         "lock_mode X\n",
 		"supremum":              "supremum",
@@ -1509,6 +1575,18 @@ func TestLock_InsertAndUpdateImplicitLocks(t *testing.T) {
 	rd.MustRows("(25)")
 	t2.Do("ROLLBACK")
 
+	L.Note("INSERT INTO T SELECT ...: the same record lock without a gap on each row inserted into T")
+	L.Exec("DROP TABLE IF EXISTS ins", "CREATE TABLE ins (id int PRIMARY KEY)", "INSERT INTO ins VALUES (5)")
+	t1.Do("START TRANSACTION")
+	t1.Do("INSERT INTO ins SELECT id FROM t WHERE id IN (10, 20)").MustAffect(2)
+	t2.Do("START TRANSACTION")
+	t2.Do("INSERT INTO ins VALUES (15)").MustNotBlock().MustOK()
+	rd = t2.Do("SELECT id FROM ins WHERE id = 20 FOR SHARE").MustBlock()
+	mustHaveLock(t, L.ShowLocks(), "T1", "X,REC_NOT_GAP", "20")
+	t1.Do("COMMIT")
+	rd.MustRows("(20)")
+	t2.Do("ROLLBACK")
+
 	t1.Do("START TRANSACTION")
 	t1.Do("UPDATE tu SET u = 25 WHERE id = 2")
 	if got, want := recordLocks(L.ShowLocks(), "T1"), []string{"X,REC_NOT_GAP 2"}; !slices.Equal(got, want) {
@@ -1654,5 +1732,73 @@ func TestDeadlock_LockTablesDetectedByMetadataLocks(t *testing.T) {
 				t.Fatalf("lock_deadlocks went from %d to %d: this deadlock is not InnoDB's to detect", before, after)
 			}
 		})
+	}
+}
+
+// 17.7.1 Gap Locks: "The reason conflicting gap locks are allowed is that if a record is
+// purged from an index, the gap locks held on the record by different transactions must be
+// merged." T1 (S) and T2 (X) both lock the gap before 20; once 20 is deleted and purged,
+// both gap locks are inherited by the next record, 30, and now cover (10,30).
+func TestLock_GapLocksMergedWhenRecordPurged(t *testing.T) {
+	L := newLab(t)
+	L.Exec("DROP TABLE IF EXISTS gp", "CREATE TABLE gp (id int PRIMARY KEY)", "INSERT INTO gp VALUES (10), (20), (30)")
+	t1, t2, t3 := L.Session("T1"), L.Session("T2"), L.Session("T3")
+	t1.Do("START TRANSACTION")
+	t1.Do("SELECT * FROM gp WHERE id = 15 FOR SHARE").MustRows("(no rows)")
+	t2.Do("START TRANSACTION")
+	t2.Do("SELECT * FROM gp WHERE id = 15 FOR UPDATE").MustNotBlock().MustRows("(no rows)")
+	locks := L.ShowLocks()
+	mustHaveLock(t, locks, "T1", "S,GAP", "20")
+	mustHaveLock(t, locks, "T2", "X,GAP", "20")
+	L.Note("record locks and gap locks do not conflict: 20 itself can be deleted")
+	t3.Do("DELETE FROM gp WHERE id = 20").MustNotBlock().MustAffect(1)
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		locks = L.Locks()
+		_, s1 := lab.FindLock(locks, "T1", "S,GAP", "30")
+		_, s2 := lab.FindLock(locks, "T2", "X,GAP", "30")
+		if s1 && s2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			L.ShowLocks()
+			t.Fatalf("the gap locks were not moved to 30 after 20 was purged")
+		}
+		// wake the purge coordinator (see TestMVCC_LongReadViewBlocksPurge)
+		L.Exec("UPDATE gp SET id = id WHERE id = 10")
+		time.Sleep(200 * time.Millisecond)
+	}
+	L.Note("20 was purged: both gap locks now sit on 30, i.e. cover (10,30)")
+	L.ShowLocks()
+	ins := t3.Do("INSERT INTO gp VALUES (25)").MustBlock()
+	t1.Do("COMMIT")
+	L.Settle()
+	ins.MustBlock()
+	t2.Do("COMMIT")
+	ins.MustOK()
+}
+
+// 17.7.5 / 17.7.5.3: "access your tables and rows in a fixed order". The two opposite-order
+// transfers of TestDeadlock_AtEveryIsolationLevel, each first locking both rows in id order
+// (ORDER BY id FOR UPDATE): the second queues behind the first instead of deadlocking.
+func TestDeadlock_AvoidedByLockOrdering(t *testing.T) {
+	L := newLab(t)
+	setupT(L)
+	t1, t2 := L.Session("T1"), L.Session("T2")
+	before := innodbDeadlocks(L)
+	t1.Do("START TRANSACTION")
+	t2.Do("START TRANSACTION")
+	t1.Do("SELECT id FROM t WHERE id IN (10, 20) ORDER BY id FOR UPDATE").MustRows("(10) (20)")
+	w := t2.Do("SELECT id FROM t WHERE id IN (10, 20) ORDER BY id FOR UPDATE").MustBlock()
+	t1.Do("UPDATE t SET v = v - 1 WHERE id = 10").MustAffect(1)
+	t1.Do("UPDATE t SET v = v + 1 WHERE id = 20").MustAffect(1)
+	t1.Do("COMMIT")
+	w.MustRows("(10) (20)")
+	t2.Do("UPDATE t SET v = v - 1 WHERE id = 20").MustAffect(1)
+	t2.Do("UPDATE t SET v = v + 1 WHERE id = 10").MustAffect(1)
+	t2.Do("COMMIT").MustOK()
+	if n := innodbDeadlocks(L); n != before {
+		t.Errorf("lock_deadlocks moved by %d, want 0", n-before)
 	}
 }

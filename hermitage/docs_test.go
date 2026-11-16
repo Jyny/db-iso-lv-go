@@ -9,7 +9,7 @@ import (
 	"github.com/jyny/db-iso-lv-go/internal/lab"
 )
 
-// TestHermitageDocs replays every code block of Hermitage's postgres.md and mysql.md
+// TestHermitageDocs replays every test block of Hermitage's postgres.md (20) and mysql.md (26)
 // statement by statement, in the documented order, and checks what the document says about
 // each statement: the rows it shows, that it BLOCKS, the error it prints.
 //
@@ -30,8 +30,11 @@ import (
 //	"block"    BLOCKS; then says how it ends once unblocked ("" = succeeds, or "=…" / "!text")
 //	"-"        not checked (COMMIT / ROLLBACK of a transaction the DB may already have aborted)
 //
-// want may end in "|frees 2" (or "|frees 2,3"): the document says this statement unblocks
-// T2's (and T3's) BLOCKED statement. A blocked statement must stay blocked until then.
+// want may end in "|frees 2" (or "|frees 2,3"): this statement unblocks T2's (and T3's)
+// BLOCKED statement. A blocked statement must stay blocked until then. Most of these are the
+// document's "This unblocks T2"; the rest are implied by it: the commit that ends the blocking
+// transaction (mysql.md P4 repeatable read says only "commit; -- T1"), or the statement whose
+// deadlock error rolls back the other side.
 type docStep struct {
 	s          int
 	sql        string
@@ -239,7 +242,8 @@ var mysqlDocs = []docBlock{
 		{1, "select * from test", "=(1,12) (2,21)", ""},
 		{2, "update test set value = 22 where id = 2", "", ""},
 		{2, "commit", "", ""},
-		{1, "select * from test", "=(1,12) (2,22)", ""},
+		{1, "select * from test", "=(1,12) (2,22)", ""}, // "either"
+		{2, "select * from test", "=(1,12) (2,22)", ""},
 	}},
 	{"G1a", "read uncommitted", both, []docStep{
 		{1, "update test set value = 101 where id = 1", "", ""},
@@ -432,7 +436,8 @@ var mysqlDocs = []docBlock{
 		{2, "insert into test (id, value) values(4, 42)", "", ""},
 		{1, "commit", "", ""},
 		{2, "commit", "", ""},
-		{1, "select * from test where value % 3 = 0", "=(3,30) (4,42)", ""},
+		{1, "select * from test where value % 3 = 0", "=(3,30) (4,42)", ""}, // "Either"
+		{2, "select * from test where value % 3 = 0", "=(3,30) (4,42)", ""},
 	}},
 	{"G2", "serializable", both, []docStep{
 		{1, "select * from test where value % 3 = 0", "", ""},
@@ -526,6 +531,10 @@ func TestHermitageDocs(t *testing.T) {
 						if db.kind == lab.MySQL {
 							sess[i].Do("set session transaction isolation level " + b.level)
 							sess[i].Do("begin")
+							// The level the document's "select @@tx_isolation" would show
+							// (renamed transaction_isolation in 8.0).
+							sess[i].Do("select @@transaction_isolation").
+								MustRows("(" + strings.ToUpper(strings.ReplaceAll(b.level, " ", "-")) + ")")
 						} else {
 							sess[i].Do("begin")
 							sess[i].Do("set transaction isolation level " + b.level)

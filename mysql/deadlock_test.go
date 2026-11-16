@@ -11,7 +11,7 @@ import (
 // close a cycle, and rolls back the transaction with the smaller "weight" (fewer rows
 // changed/locked). The victim's WHOLE transaction is rolled back (ERROR 1213).
 //
-// Cases marked "aneasystone #N" are ported from https://github.com/alleycat1/mysql-deadlocks-case
+// Cases marked "case #N" are ported from https://github.com/alleycat1/mysql-deadlocks-case
 // (originally reproduced on MySQL 5.7). The `deadlock` field records what MySQL 9.7 does.
 
 type step struct {
@@ -33,7 +33,7 @@ type deadlockCase struct {
 
 var deadlockCases = []deadlockCase{
 	{
-		name: "OppositeOrder", ref: "aneasystone #8",
+		name: "OppositeOrder", ref: "case #8",
 		why: "T1 locks 10 then 20, T2 locks 20 then 10",
 		steps: []step{
 			{1, "DELETE FROM t WHERE id = 10"},
@@ -44,7 +44,7 @@ var deadlockCases = []deadlockCase{
 		deadlock: true,
 	},
 	{
-		name: "CheckThenInsert_GapLocks", ref: "aneasystone #1 (pattern)",
+		name: "CheckThenInsert_GapLocks", ref: "case #1 (pattern)",
 		why: "both lock the same gap with FOR UPDATE on a missing key (gap locks are compatible),\n" +
 			"then each INSERT needs an insert-intention lock that conflicts with the other's gap lock",
 		steps: []step{
@@ -56,7 +56,7 @@ var deadlockCases = []deadlockCase{
 		deadlock: true,
 	},
 	{
-		name: "DuplicateInsertThenRollback", ref: "aneasystone #2 / MySQL manual",
+		name: "DuplicateInsertThenRollback", ref: "case #2 / MySQL manual",
 		why: "T2 and T3 both wait with S locks on T1's uncommitted duplicate; when T1 rolls back\n" +
 			"both get S, and both then need X to insert → each waits for the other's S",
 		setup: []string{
@@ -72,7 +72,7 @@ var deadlockCases = []deadlockCase{
 		deadlock: true,
 	},
 	{
-		name: "DeleteThenReinsertSameKey", ref: "aneasystone #18",
+		name: "DeleteThenReinsertSameKey", ref: "case #18",
 		why: "T1 deletes id=4 (X record lock); T2's delete waits; T1 re-inserts 4 and its duplicate\n" +
 			"check on the delete-marked record queues behind T2's waiting X request",
 		setup: []string{
@@ -90,7 +90,7 @@ var deadlockCases = []deadlockCase{
 			"record, so the re-insert's duplicate check does not queue behind T2's waiting request",
 	},
 	{
-		name: "UniqueSecondary_DeleteInsert", ref: "aneasystone #4",
+		name: "UniqueSecondary_DeleteInsert", ref: "case #4",
 		why: "T2 deletes a=2; T1's delete of a=2 waits; T2 re-inserts a=2, whose duplicate check\n" +
 			"needs S on the delete-marked a=2, conflicting with T1's waiting X",
 		setup: []string{
@@ -108,7 +108,7 @@ var deadlockCases = []deadlockCase{
 			"delete-marked a=2 (it already holds X on the record), which never wait for T1's X request",
 	},
 	{
-		name: "NonUniqueSecondary_DeleteInsertGap", ref: "aneasystone #12",
+		name: "NonUniqueSecondary_DeleteInsertGap", ref: "case #12",
 		why: "T1 deletes a=5 (next-key lock (2,5] + gap (5,6)); T2's delete of a=5 waits;\n" +
 			"T1 inserts a=2 into the gap before 5, which T2's WAITING next-key request also covers",
 		setup: []string{
@@ -124,7 +124,7 @@ var deadlockCases = []deadlockCase{
 		deadlock: true,
 	},
 	{
-		name: "UniqueSecondary_InsertInsert", ref: "aneasystone #15",
+		name: "UniqueSecondary_InsertInsert", ref: "case #15",
 		why: "T1's insert of a=10 waits with a next-key S lock on T2's uncommitted a=10;\n" +
 			"T2's next insert (a=9) lands in the gap that T1's waiting S lock covers",
 		setup: []string{
@@ -140,7 +140,7 @@ var deadlockCases = []deadlockCase{
 		deadlock: true,
 	},
 	{
-		name: "UpdateUniqueKey_ThreeSessions", ref: "aneasystone #11",
+		name: "UpdateUniqueKey_ThreeSessions", ref: "case #11",
 		why: "three updates of the same unique-key row wait in line; after T1 commits, T2 and T3\n" +
 			"both get S locks on the new index entry and then both need X",
 		setup: []string{

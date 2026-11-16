@@ -43,6 +43,16 @@ func TestMVCC_ReadersAndWritersDontBlock(t *testing.T) {
 	L.Note("and an open reader does not block a writer")
 	w.Do("UPDATE r SET v = 4 WHERE id = 1").MustNotBlock().MustOK()
 	rd.Do("COMMIT")
+
+	L.Note(`"even when providing the strictest level of transaction isolation through the use of
+an innovative Serializable Snapshot Isolation (SSI) level": SIRead locks never block`)
+	rd.Do("BEGIN ISOLATION LEVEL SERIALIZABLE")
+	w.Do("BEGIN ISOLATION LEVEL SERIALIZABLE")
+	rd.Do("SELECT v FROM r WHERE id = 1").MustRows("(4)")
+	w.Do("UPDATE r SET v = 5 WHERE id = 1").MustNotBlock().MustOK()
+	rd.Do("SELECT v FROM r WHERE id = 1").MustNotBlock().MustRows("(4)")
+	w.Do("COMMIT").MustOK()
+	rd.Do("COMMIT").MustOK()
 }
 
 // 13.2.1: in READ COMMITTED every statement takes a new snapshot. A transaction sees its own
@@ -376,6 +386,45 @@ func TestIso_SER_CheckBeforeInsertTurnsUniqueViolationInto40001(t *testing.T) {
 	}
 }
 
+// 13.2.3 and 13.5: the check only turns 23505 into 40001 when every inserter follows the
+// protocol, at SERIALIZABLE.
+//   - 13.2.3: "If some Serializable transactions insert new keys directly without following
+//     this protocol, unique constraints violations might be reported even in cases where they
+//     could not occur in a serial execution". T2 checked and found no key, yet gets 23505
+//     because T1 inserted without checking. In either serial order T2 would not fail: after
+//     T1 its check finds the key and it skips the insert.
+//   - 13.5: at READ COMMITTED / REPEATABLE READ the same check-then-insert is "effectively a
+//     serialization failure, but the server will not detect it as such because it cannot
+//     'see' the connection between the inserted value and the previous reads": 23505.
+func TestIso_CheckBeforeInsertNeedsEveryInserterAndSerializable(t *testing.T) {
+	for _, c := range []struct {
+		name           string
+		level          lab.Level
+		check1, check2 bool
+	}{
+		{"SER/first-inserter-skips-check", lab.Serializable, false, true},
+		{"SER/second-inserter-skips-check", lab.Serializable, true, false},
+		{"RC/both-check", lab.ReadCommitted, true, true},
+		{"RR/both-check", lab.RepeatableRead, true, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			L := newLab(t)
+			L.Exec("DROP TABLE IF EXISTS users", "CREATE TABLE users (username text primary key)")
+			t1, t2 := L.Session("T1"), L.Session("T2")
+			for i, s := range []*lab.Session{t1, t2} {
+				s.Begin(c.level)
+				if []bool{c.check1, c.check2}[i] {
+					s.Do("SELECT 1 FROM users WHERE username = 'alice'").MustRows("(no rows)")
+				}
+			}
+			t1.Do("INSERT INTO users VALUES ('alice')")
+			ins := t2.Do("INSERT INTO users VALUES ('alice')").MustBlock()
+			t1.Do("COMMIT")
+			ins.MustFail(lab.IsUniqueViolation)
+		})
+	}
+}
+
 // 13.2 (Important box): sequence changes are visible immediately to everyone and are never
 // rolled back, so serial columns get gaps.
 func TestMVCC_SequencesAreNotTransactional(t *testing.T) {
@@ -586,15 +635,19 @@ func TestLock_RowLocksTakenByStatements(t *testing.T) {
 func TestLock_RowLockSavepoints(t *testing.T) {
 	L := newLab(t)
 	setupRows(L)
-	t1, t2 := L.Session("T1"), L.Session("T2")
+	t1, t2, t3 := L.Session("T1"), L.Session("T2"), L.Session("T3")
 	t1.Do("BEGIN")
 	t1.Do("SELECT * FROM r WHERE id = 1 FOR SHARE")
 	t1.Do("SAVEPOINT a")
 	t1.Do("SELECT * FROM r WHERE id = 1 FOR UPDATE").MustNotBlock().MustOK()
 	L.Show("SELECT locked_row, multi, modes FROM pgrowlocks('r')")
-	upd := t2.Do("UPDATE r SET v = 1 WHERE id = 1").MustBlock()
+	L.Note("FOR SHARE is compatible with T1's FOR SHARE, so only the FOR UPDATE can make it fail")
+	t3.Do("SELECT 1 FROM r WHERE id = 1 FOR SHARE NOWAIT").MustFail(lab.IsLockNotAvailable)
 	t1.Do("ROLLBACK TO SAVEPOINT a")
-	L.Note("FOR UPDATE is gone, but the FOR SHARE taken before the savepoint still blocks T2")
+	L.Note("the FOR UPDATE is released: FOR SHARE now succeeds at once")
+	t3.Do("SELECT 1 FROM r WHERE id = 1 FOR SHARE NOWAIT").MustOK()
+	L.Note("but the FOR SHARE taken before the savepoint still blocks an UPDATE")
+	upd := t2.Do("UPDATE r SET v = 1 WHERE id = 1").MustBlock()
 	L.Settle()
 	upd.MustBlock()
 	t1.Do("COMMIT")
@@ -762,6 +815,10 @@ func TestLock_AdvisoryLockFilterPitfall(t *testing.T) {
 }
 
 // 13.4.2: SELECT FOR UPDATE locks only the returned rows, and only until the transaction ends.
+// A blocked UPDATE or DELETE then proceeds. (In READ COMMITTED it would proceed even if T1
+// had updated the row: it re-checks the newest version. The docs' "unless an actual UPDATE
+// of the row was performed" is about REPEATABLE READ / SERIALIZABLE; see
+// TestIso_RR_ConcurrentChangeOutcomes.)
 func TestLock_ForUpdateLocksOnlyReturnedRows(t *testing.T) {
 	L := newLab(t)
 	setupRows(L)
@@ -771,8 +828,15 @@ func TestLock_ForUpdateLocksOnlyReturnedRows(t *testing.T) {
 	t2.Do("UPDATE r SET v = 1 WHERE id = 2").MustNotBlock().MustOK()
 	upd := t2.Do("UPDATE r SET v = 1 WHERE id = 1").MustBlock()
 	t1.Do("COMMIT")
-	L.Note("T1 never updated the row, so T2's blocked UPDATE simply proceeds")
+	L.Note("T1's lock is gone at COMMIT, so T2's blocked UPDATE proceeds")
 	upd.MustAffect(1)
+
+	t1.Do("BEGIN")
+	t1.Do("SELECT * FROM r WHERE id = 2 FOR UPDATE")
+	del := t2.Do("DELETE FROM r WHERE id = 2").MustBlock()
+	t1.Do("COMMIT")
+	L.Note("the same for a blocked DELETE")
+	del.MustAffect(1)
 }
 
 // 13.4.2: in REPEATABLE READ the snapshot is frozen by the first query, not by BEGIN, so a
@@ -872,6 +936,23 @@ func TestMVCC_TruncateIsNotMVCCSafe(t *testing.T) {
 			rd.Do("COMMIT")
 		})
 	}
+	t.Run("inconsistent-with-other-tables", func(t *testing.T) {
+		// "an apparent inconsistency between the contents of the truncated table and other
+		// tables in the database": one transaction empties both big5 and its mirror, so the
+		// only committed states are (5,5) and (0,0); the old snapshot sees (0,5).
+		L := newLab(t)
+		L.Exec("DROP TABLE IF EXISTS big5, mirror5", "CREATE TABLE big5 (v int)", "INSERT INTO big5 SELECT generate_series(1, 5)",
+			"CREATE TABLE mirror5 AS SELECT * FROM big5")
+		rd, dd := L.Session("RD"), L.Session("DDL")
+		rd.Do("BEGIN ISOLATION LEVEL REPEATABLE READ")
+		rd.Do("SELECT 1")
+		dd.Do("BEGIN")
+		dd.Do("TRUNCATE big5")
+		dd.Do("DELETE FROM mirror5")
+		dd.Do("COMMIT").MustOK()
+		rd.Do("SELECT (SELECT count(*) FROM big5), (SELECT count(*) FROM mirror5)").MustRows("(0,5)")
+		rd.Do("COMMIT")
+	})
 	t.Run("blocked-if-already-read", func(t *testing.T) {
 		L := newLab(t)
 		L.Exec("DROP TABLE IF EXISTS big5", "CREATE TABLE big5 (v int)", "INSERT INTO big5 SELECT generate_series(1, 5)")
