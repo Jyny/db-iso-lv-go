@@ -11,7 +11,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -632,8 +634,8 @@ func TestMVCC_InsertSelectReadsLatestCommitted(t *testing.T) {
 	a.Do("COMMIT")
 }
 
-// 17.7.2.3: the manual's timeline. With autocommit=0, A only sees B's committed row after A
-// itself commits and so takes a new snapshot.
+// 17.7.2.3: the manual's timeline (its table t is called tp here). With autocommit=0, A only
+// sees B's committed row after A itself commits and so takes a new snapshot.
 func TestMVCC_TimepointAdvancesAfterCommitDocsExample(t *testing.T) {
 	L := newLab(t)
 	L.Exec("DROP TABLE IF EXISTS tp", "CREATE TABLE tp (a int, b int)")
@@ -738,7 +740,7 @@ func TestLock_InsertSelectLocksSource(t *testing.T) {
 	}
 }
 
-// 17.7.2.4 Locking Reads.
+// 17.7.2.4 Locking Reads. The manual's NOWAIT / SKIP LOCKED table t is called tn here.
 func TestLock_LockingReadsDocs(t *testing.T) {
 	t.Run("nowait-skip-locked", func(t *testing.T) {
 		L := newLab(t)
@@ -1105,6 +1107,16 @@ JOIN performance_schema.threads b ON b.THREAD_ID = w.BLOCKING_THREAD_ID`)
 			t.Errorf("LATEST DETECTED DEADLOCK does not contain %q", want)
 		}
 	}
+	// "It also shows that the read-only transaction id ... changes to sequential transaction
+	// id": in the dump B is transaction (1), under the id it had while waiting, and A is
+	// transaction (2), under a sequential id it got when its UPDATE started.
+	ids := regexp.MustCompile(`\*\*\* \((\d)\) TRANSACTION:\nTRANSACTION (\d+),`).FindAllStringSubmatch(status, -1)
+	if len(ids) != 2 || ids[0][2] != fmt.Sprint(idB) {
+		t.Fatalf("deadlock dump lists transactions %v, want two with B's id %d first", ids, idB)
+	}
+	if dumpA, _ := strconv.ParseUint(ids[1][2], 10, 64); dumpA == 0 || dumpA >= readOnlyIDs {
+		t.Fatalf("A appears in the dump as transaction %s, want a sequential id (its read-only id was %d)", ids[1][2], idA)
+	}
 	upd.MustAffect(1)
 	b.Do("COMMIT")
 
@@ -1158,6 +1170,121 @@ func TestDeadlock_VictimIsSmallerTransaction(t *testing.T) {
 			}
 			big.Do("ROLLBACK")
 		})
+	}
+}
+
+// 17.7.5.2: "a wait-for list that exceeds 200 transactions is treated as a deadlock and the
+// transaction attempting to check the wait-for list is rolled back". Measured on 9.7: it is
+// not. 250 transactions each hold a row and wait for the previous one's row, a wait-for
+// chain 249 transactions deep, and every one of them keeps waiting (lock_deadlocks does not
+// move). Closing the chain into a 250-transaction cycle is detected at once: exactly one
+// transaction gets 1213.
+//
+// The chain runs on plain connections from a pool of its own: the harness polls every
+// blocked session after every step, which is quadratic in the number of waiters.
+func TestDeadlock_LongWaitForChainIsNotADeadlock(t *testing.T) {
+	const n = 250
+	L := newLab(t)
+	setGlobal(t, L, "max_connections", strconv.Itoa(n+100))
+	L.Exec("DROP TABLE IF EXISTS wchain", "CREATE TABLE wchain (id int PRIMARY KEY, v int)",
+		fmt.Sprintf("INSERT INTO wchain WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < %d) SELECT i, 0 FROM s", n))
+	pool, err := sql.Open("mysql", lab.DSN(lab.MySQL, dbname))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+	conns := make([]*sql.Conn, n+1) // conns[i] holds row i
+	for i := 1; i <= n; i++ {
+		c, err := pool.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		for _, q := range []string{"SET SESSION innodb_lock_wait_timeout = 60", "START TRANSACTION",
+			fmt.Sprintf("UPDATE wchain SET v = %d WHERE id = %d", i, i)} {
+			if _, err := c.ExecContext(ctx, q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		conns[i] = c
+	}
+	waits := func() int {
+		var w int
+		if err := L.Admin.QueryRow(`SELECT count(*) FROM performance_schema.data_locks
+WHERE OBJECT_SCHEMA = DATABASE() AND OBJECT_NAME = 'wchain' AND LOCK_STATUS = 'WAITING'`).Scan(&w); err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+	type result struct {
+		i   int
+		err error
+	}
+	results := make(chan result, n)
+	wait := func(i, row int) {
+		go func() {
+			_, err := conns[i].ExecContext(ctx, fmt.Sprintf("UPDATE wchain SET v = %d WHERE id = %d", i, row))
+			results <- result{i, err}
+		}()
+	}
+	before := innodbDeadlocks(L)
+	// Ti waits for T(i-1), one at a time, so each new waiter sits at the end of a chain one
+	// transaction longer than the last.
+	for i := 2; i <= n; i++ {
+		wait(i, i-1)
+		deadline := time.Now().Add(10 * time.Second)
+		for waits() < i-1 {
+			select {
+			case r := <-results:
+				t.Fatalf("T%d's wait (chain depth %d) ended with %v", r.i, r.i-1, r.err)
+			default:
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("T%d never showed up in data_lock_waits", i)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	time.Sleep(200 * time.Millisecond) // give the background deadlock detector a chance
+	select {
+	case r := <-results:
+		t.Fatalf("T%d's wait ended with %v", r.i, r.err)
+	default:
+	}
+	L.Note("a wait-for chain %d transactions deep: %d waits, lock_deadlocks moved by %d", n-1, waits(), innodbDeadlocks(L)-before)
+	if w := waits(); w != n-1 {
+		t.Fatalf("%d lock waits, want %d", w, n-1)
+	}
+	if d := innodbDeadlocks(L) - before; d != 0 {
+		t.Fatalf("lock_deadlocks moved by %d on a chain without a cycle", d)
+	}
+
+	L.Note("T1 now waits for T%d: a cycle of %d transactions", n, n)
+	wait(1, n)
+	// Unwind: whenever a statement returns, roll its transaction back, which grants the
+	// next waiter in the chain.
+	victims := 0
+	for done := 0; done < n; done++ {
+		var r result
+		select {
+		case r = <-results:
+		case <-time.After(20 * time.Second):
+			t.Fatalf("%d of %d statements returned; the rest are still waiting", done, n)
+		}
+		if r.err != nil {
+			if !lab.IsDeadlock(r.err) {
+				t.Fatalf("T%d: %v", r.i, r.err)
+			}
+			victims++
+			L.Note("victim: T%d (%s)", r.i, lab.Describe(r.err))
+		}
+		if _, err := conns[r.i].ExecContext(ctx, "ROLLBACK"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := innodbDeadlocks(L) - before; victims != 1 || d != 1 {
+		t.Fatalf("%d victims, lock_deadlocks moved by %d; want 1 and 1", victims, d)
 	}
 }
 
@@ -1560,7 +1687,8 @@ func TestLock_MonitorOutputDocsExamples(t *testing.T) {
 		"intention lock":      "TABLE LOCK table `" + dbname + "`.`child` trx id",
 		"intention lock mode": "lock mode IX",
 		"record lock":         "lock_mode X locks rec but not gap",
-		// the manual prints index `PRIMARY`; 9.7 drops the backquotes around the index name
+		// 17.7.1 prints index `PRIMARY`; 9.7 drops the backquotes around the index name, as
+		// the manual's own (newer) dump in 17.7.5.1 does
 		"record lock header":    "index PRIMARY of table `" + dbname + "`.`child`",
 		"next-key lock":         "lock_mode X\n",
 		"supremum":              "supremum",
@@ -2040,7 +2168,8 @@ func TestLock_SpatialNoPredicateLockInReadCommitted(t *testing.T) {
 // 17.7.1 Gap Locks: "SELECT c1 FROM t WHERE c1 BETWEEN 10 and 20 FOR UPDATE; prevents other
 // transactions from inserting a value of 15 into column t.c1, whether or not there was
 // already any such value in the column, because the gaps between all existing values in the
-// range are locked." Both ways: c1 = 15 present (non-unique index) and absent (unique index).
+// range are locked." (The manual's table t is called c1n here.) Both ways: c1 = 15 present
+// (non-unique index) and absent (unique index).
 // The next-key lock on 10 also covers the gap below the range, (5, 10): 7 waits too. Only
 // below 5 is free.
 func TestLock_GapLockBetweenDocsExample(t *testing.T) {
@@ -2070,6 +2199,7 @@ func TestLock_GapLockBetweenDocsExample(t *testing.T) {
 
 // 17.7.1 Record Locks: "SELECT c1 FROM t WHERE c1 = 10 FOR UPDATE; prevents any other
 // transaction from inserting, updating, or deleting rows where the value of t.c1 is 10."
+// (The manual's table t is called c1r here.)
 func TestLock_RecordLockBlocksInsertUpdateDelete(t *testing.T) {
 	L := newLab(t)
 	L.Exec("DROP TABLE IF EXISTS c1r", "CREATE TABLE c1r (c1 int PRIMARY KEY, v int)", "INSERT INTO c1r VALUES (10, 0)")

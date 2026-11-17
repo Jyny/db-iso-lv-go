@@ -10,6 +10,8 @@ import (
 
 // The four row-level lock modes and which pairs conflict.
 // https://www.postgresql.org/docs/18/explicit-locking.html#LOCKING-ROWS
+// "Row-level locks do not affect data querying; they block only writers and lockers to the
+// same row": a plain SELECT of the row goes through under each of the four.
 func TestLock_RowLockConflictMatrix(t *testing.T) {
 	L := newLab(t)
 	L.Exec("DROP TABLE IF EXISTS rl", "CREATE TABLE rl (id int primary key, v int)", "INSERT INTO rl VALUES (1, 1)")
@@ -30,6 +32,9 @@ func TestLock_RowLockConflictMatrix(t *testing.T) {
 			t1.Do("BEGIN")
 			t1.Do("SELECT * FROM rl WHERE id = 1 FOR " + held)
 			t2.Do("BEGIN")
+			if j == 0 {
+				t2.Do("SELECT * FROM rl WHERE id = 1").MustNotBlock().MustRows("(1,1)")
+			}
 			op := t2.Do("SELECT * FROM rl WHERE id = 1 FOR " + req)
 			blocked := op.Blocked
 			t1.Do("ROLLBACK")
